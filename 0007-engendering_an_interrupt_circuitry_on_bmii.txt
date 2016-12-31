@@ -1,0 +1,390 @@
+Engendering An Interrupt Circuit On BMII
+========================================
+29/12/2016
+
+While the former 'control registers'-based IOModule model defined in BMII was
+mostly suitable to represent a wide variety of interfaces between a host and
+its controlled devices, it became quite embarrassing when dealing with modules
+that had to be controlled asynchronously.
+
+Event-based communication had to be implemented by polling a STATUS register
+which contained flags representing the availability of a data or a unit.
+Although quite common in 'real-life' applications, this kind of mechanism is
+most of the time coupled with an interrupt system.
+
+This principle allowed the controller to perform another task while waiting
+for events coming from one of its devices.
+
+An implementation of such mechanism has been tested in BMII[1].
+Due to its nature, many aspects of it have been tweaked to fit the existing
+design choices and its technical limitations.
+
+# API changes
+
+In order to allow the definition of the interrupt circuit, the existing API
+has been extended. It now integrates objects used to generate the RTL of the
+interrupt circuit as well as functions to define how the host is supposed to
+handle events coming from the CPLD.
+
+## Declaring the interrupt line
+
+The following example demonstrates a basic IOModule which generates interrupt
+requests for each edge of its input signal.
+
+    class IntPushButtonIOModule(IOModule):
+        def __init__(self):
+            IOModule.__init__(self, "int_push_button")
+
+            # Declares input signal
+            self.iosignals += IOSignal("IN", IOSignalDir.IN)
+
+            # Defines pulse signals from input
+            pressed = Signal()
+            released = Signal()
+
+            # Converts the level-signal into a single-tick pulse
+            self.submodules.pressed = LevelToPulse(~self.iosignals.IN, pressed)
+            self.submodules.released = NLevelToPulse(~self.iosignals.IN, released)
+
+            # Declares interrupt signals
+            self.intrs += IntRequest("PRESSED", pressed)
+            self.intrs += IntRequest("RELEASED", released)
+
+
+## Connecting the interrupt line to the interrupt circuitry
+
+Once the interrupt lines have been declared, it is necessary to define how they
+are connected to the top-level design. In the same manner that 'iosignals' are
+connected to the 'southbridge', the 'northbridge' has been designed to be
+responsible for multiplexing the interrupt lines:
+
+    ipb = IntPushButton()
+    bmii.add_module(ipb)
+
+    # Connects input to switch in southbridge
+    bmii.ioctl.sb.pins.SW += ipb.iomodule.iosignals.IN
+
+    # Connects interrupt lines to interrupt circuit in northbridge
+    bmii.ioctl.nb.interrupts += ipb.iomodule.intrs.PRESSED
+    bmii.ioctl.nb.interrupts += ipb.iomodule.intrs.RELEASED
+
+On this model, the first interrupt line appended in the northbridge has the
+highest priority while the latest has the lower one.
+The priority level can also be manually set by using the `connect` method:
+
+    # Highest priority
+    bmii.ioctl.nb.interrupts.connect(0, ipb.iomodule.intrs.PRESSED)
+
+    # Lowest priority
+    bmii.ioctl.nb.interrupts.connect(1, ipb.iomodule.intrs.RELEASED)
+
+## Interrupt Handler
+
+On the host side, the definition of event callbacks is performed by the
+'interrupt_handler' decorator that takes the identifier of the interrupt as
+parameter. Callbacks take pointers to the BMIIModule and the BMII top-level
+object for arguments.
+
+    @interrupt_handler("PRESSED")
+    def handle_pressed(self, bmii):
+        logging.info("Push button pressed")
+
+    @interrupt_handler("RELEASED")
+    def handle_released(self, bmii):
+        logging.info("Push button released")
+
+Due to some technical limitations described in the next sections, these
+events cannot be completely asynchronous. The polling of pending interrupts
+has to be performed from the host using the following top-level method:
+
+    bmii.handle_interrupts()
+
+The command line has also been extended with the 'run' command that waits and
+handle interrupts from a particular module:
+
+    $ bmii -v -m intr run
+    [INFO] Push button pressed
+    [INFO] Push button released
+
+# Under The Hood
+
+## The Interrupt Request Signal
+
+For each interrupt request defined in an IOModule, a circuit has to be
+generated to ensure the 'local' logic needed to correctly drive the request
+line. Its role is mainly to transform a trigger signal to a reliable request
+information. For that, two methods are commonly used.
+
+### Edge triggered
+
+The first one consists in asserting the interrupt request signal as soon as a
+front-edge is detected on the trigger signal. From the RTL perspective, this
+means introducing another clock domain driven by the trigger signal (more or
+less conditioned by some combinatory logic). An example of such circuit could
+be:
+
+     eoi      pending  trigger  ack         intr
+      |           |        |     |           |
+      |           |        |     |           |
+      |           |        |     |           |
+      | +-----+   |        |     | +-----+   |
+      +-|R   Q|---+        |     +-|R   Q|---+
+        |     |            |       |     |
+      +-|S  /Q|--------&---+     +-|S    |
+      | +-----+        |         | +-----+
+      |                |         |
+      +----------------+---------+
+
+
+- intr
+    Asserting this signal alerts the interrupt circuit that the IOModule is
+    requesting an interruption.
+- trigger
+    The front-edge of this signal triggers the interrupt request.
+- ack
+    Driven by the interrupt circuit, this signal indicates that the request
+    has been received and is going to be handled. When asserted, the `intr` is
+    cleared in order to avoid a second engagement from this request.
+- pending
+    Indicates that the interrupt request is still pending and is not yet
+    completed.
+- eoi (End-Of-Interrupt)
+    Asserting this signal terminates the interrupt cycle, allowing a potential
+    next request to be started. It is driven by the interrupt circuit when all
+    handlers associated to this request have been completely executed.
+
+Even though the edge triggered interrupt are preferred for firing events from
+short-width pulses, the logic implied here stays highly prone to spurious
+interrupts and the desynchronization from the system clock could lead to
+undefined behavior if not interfaced correctly with the rest of the design.
+
+### Level triggered
+
+Another strategy to manage the interrupt pin tickling is to sample the trigger
+signal synchronously to the system clock. This method forbids the detection
+of a pulse signal which its width is smaller than the system clock's period.
+The roles of the previously defined signals remain but are now latched
+synchronously with the system clock:
+
+    self.sync += \
+            If(intr.ack,
+                intr.eq(0)).\
+            Elif(intr.eoi,
+                intr.pending.eq(0)).\
+            Elif(~intr.pending & intr.trigger,
+                intr.eq(1),
+                intr.pending.eq(1))
+
+Due to its reliability, this design has been preferred in this project.
+
+## The Northbridge Evolves
+
+The multiplexing of the IRQ signals to the unique interrupt pin of the USB
+controller is managed by the northbridge. This unit was already responsible for
+bridging the GPIF signals with the IO controller's internal bus.
+
+### Firing the IRQ
+
+The '#int0' output connected to the USB controller is basically an OR-reduced
+version of the interrupt requests coming from the IO modules.
+When an interrupt request is pending, the data bus of the GPIF is used to drive
+the number of the interrupt line instead of ensuring its primary purpose.
+
+        Northbridge                      USB Controller
+
+            +----+                 |
+    intr1 ->|    |                 |
+    intr2 ->| or |-------------+------ #int0
+    intr3 ->|    |             |   |
+            +----+             |   |
+                               |   |
+            +----------+       |   |
+    intr1 ->| Priority |     |\|   |
+    intr2 ->|          |---->| \   |
+    intr3 ->| Encoder  |     |  |  |
+            +----------+     |  |----- fd[0:7]
+                             |  |  |
+          usual circuit ---->| /   |
+                             |/    |
+
+
+### Acknowledgement
+
+As the GPIF is now completely recycled in case of interrupt request, the
+expected behavior from the USB controller is to read the interrupt number by
+performing a 'GPIF single read'. The reading operation is expected to be
+coupled with the assertion of the CTL2, an additional pin managed by the GPIF
+and usually used to ensure this kind of control operation.
+
+The assertion of this 'acknowledgment' signal is the intended mechanism to
+indicate to the interrupt circuit that the USB controller has considered the
+request and is asking for the clearing of the `intr` signal of the highest
+priority interrupt.
+
+
+            +----------+
+    intr1 ->| Priority |       +---+    +---+    |
+      ... ->|          |------>| = |--->| & |<----- CTL2
+        +-->| Encoder  |       +---+    +---+    |
+        |   +----------+         ^        |
+        |                  intr  |        | ack
+        |                 number |        v
+        |                      +---------------+
+        +----------------------|  IRQ circuit  |
+                          intr +---------------+
+
+### End-Of-Interrupt
+
+Even though the acknowledgement ends the signalling of the request to the USB
+controller, it doesn't mean that the interrupt request has been completely
+handled. In order to avoid additional triggering of an event that is currently
+processed by another component, the local interrupt circuit is locked (using
+the 'pending' signal) until the host explicitly terminates it.
+
+To implement this mechanism, a new control register has been added to the
+northbridge: EOI. To trigger the end-of-interrupt signal of a particular
+interrupt line, the host has to write the corresponding interrupt number in
+this register.
+
+    bmii.northridge.drv.EOI = IRQ_number
+
+The termination of the request is performed as soon as the writing operation
+is completed, allowing the event to be re-triggered again.
+
+                                 +-------------+
+                            +----| IRQ circuit |
+                       intr |    +-------------+
+                     number |        ^
+                            |        | eoi
+         CtrlRegs           v        |
+          +-----+ value   +---+    +---+
+    IBus--| EOI |-------->| = |--->| & |
+          +-----+         +---+    +---+
+             |                       ^
+             |                       |
+             +-----------------------+
+                 wr_pulse
+
+## The USB Controller's Unused Pin
+
+The two interrupt pins of the FX2LP had been connected to the CPLD but
+were never used before the implementation of this capability.
+
+After enabling and unmasking the interrupt from the FX2LP's firmware, the
+handling of the INT0 interrupt is achieved as follow:
+
+    void int0_isr(void) __interrupt IE0_ISR
+    {
+        BYTE dummy;
+
+        gpif_enable();                          /* Re-enable GPIF */
+        wait_gpif_done();                       /* Wait until GPIF ready */
+        dummy = XGPIFSGLDATLX;                  /* Trigger reading of single
+                                                   word through GPIF
+                                                   by performing a dummy read
+                                                   on XGPIFSGLDATLX register */
+
+        wait_gpif_done();                       /* Wait until the end of
+                                                   reading operation */
+        event_queue_enqueue(XGPIFSGLDATLNOX);   /* Enqueue the read value
+                                                   without starting a new
+                                                   transmission */
+
+        IE0 = 0;                                /* Clear interrupt flag */
+    }
+
+As the CPLD is now expected to drive the data bus with the interrupt number,
+the FX2LP just has to read it though the GPIF and to store it in a
+dedicated data structure.
+
+### Event Queue
+
+Once the interrupt number has been retrieved, it is pushed on a queue located
+in the USB controller's memory. These event notifications are then waiting to
+be dequeued by the host through a vendor-specific USB request.
+
+As the event numbers are pushed by the interrupt handler, the queuing and
+dequeuing operations are asynchronous: some precautions have to be taken when
+manipulating this structure. A naive implementation of those operations
+necessitates the usage of a lock to ensure the integrity of the data stored.
+
+From a low-level perspective, such mechanism requires an atomic
+`Test-And-Set` instruction or equivalent. On a 8051, the architecture of the
+USB controller's core, the only similar instruction proposed is `jbc`.
+This one jumps to a specified address if a bit located in the core memory is set
+and clears it afterwards. Although limited in space, the core memory is
+bit-addressable as opposed to XDATA memory.
+
+There is no explicit way to use this instruction in SDCC[2]. Instead, it
+atomically detects the following pattern to generate the `jbc` instruction:
+
+    static volatile __bit mutex;
+
+    // Acquire mutex
+    for (;;) {
+        if (mutex) {
+            mutex = 0;
+            break;
+        }
+    }
+
+This spinlock definition generates this code:
+
+    _event_queue_lock:
+    00104$:
+        jbc     _mutex,00114$   ;; Jump if direct bit = 1, then clear the bit
+        sjmp    00104$          ;; Unconditional short jump
+    00114$:
+
+A possible deadlock here would be reached in case of interrupt storm. An
+uncontrolled interrupt line could lead to an unresponsive USB controller, which
+could brick the board since this chip also acts as a JTAG programmer for the
+CPLD.
+
+A countermeasure for that is simply to disable the interrupt line once the
+event queue is full and to leave it masked until an event is dequeue from the host:
+
+    if (ep.size >= EVENT_QUEUE_SIZE)
+        EX0 = 0;                        /* Disable INT0 */
+
+
+### Querying events
+
+As explained previously, the events enqueued have to be queried by the host.
+To allow that, a new vendor command has been added to the USB interface:
+
+    0xF3 - GET_EVENT
+
+It requests the number of next pending event and can be initiated by using a
+control transfer:
+
+    dev.ctrl_transfer(
+            bmRequestType=bmRequestType.VENDOR_READ,
+            bRequest=bRequest.GET_EVENT,
+            wValue=0,
+            wIndex=0,
+            data_or_wLength=1)  # Request 1 byte from device
+
+In the USB controller side, the code is as trivial as:
+
+    case GET_EVENT:
+        /* Enqueue the next event in EP0BUF */
+        EP0BUF[0] = event_queue_dequeue();
+
+        /* Send 1 byte through EP0BUF */
+        EP0BCH = 0;
+        EP0BCL = 1;
+
+This method is clearly the bottleneck of all the fancy mechanisms explained in
+this post as the host is forced to synchronously poll the FX2LP. Such situation
+is caused by the limitation of the USB2 protocol. Maybe another USB
+configuration could provide better response time to events, let's find out
+another time...
+
+# Links
+
+[1]: https://github.com/psurply/bmii/commit/97f22d4a84287dbb25c76145dbce44cea4fa8ae1
+[2]: http://sdcc.sourceforge.net/
+
+-- 
+Pierre Surply
