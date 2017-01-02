@@ -1,5 +1,6 @@
 Hacking a Sega Whitestar Pinball
 ================================
+2014-12-16
 
 ## Sega Starship Troopers Pinball Overview
 

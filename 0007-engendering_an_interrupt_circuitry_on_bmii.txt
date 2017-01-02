@@ -1,6 +1,6 @@
 Engendering An Interrupt Circuit On BMII
 ========================================
-29/12/2016
+2016-12-29
 
 While the former 'control registers'-based IOModule model defined in BMII was
 mostly suitable to represent a wide variety of interfaces between a host and

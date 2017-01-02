@@ -1,5 +1,6 @@
 Designing an Intel 80386SX development board
 ============================================
+2015-11-16
 
 The LSE-PC aims to be a compact IBM-PC compatible development board based on an
 Intel `80386SX` CPU and an Altera *Cyclone IV* `EP4CE22E22` FPGA in order to

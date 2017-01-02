@@ -1,6 +1,6 @@
 When the Asynchronous Receiver/Transmitter cannot be Universal
 ==============================================================
-12/11/2016
+2016-11-12
 
 Due to its ease of use and its unrestrictive electrical requirements,
 asynchronous serial communications at TTL levels stay nowadays the preferred

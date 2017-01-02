@@ -1,5 +1,6 @@
 Sega Whitestar Pinball: Sound board
 ===================================
+2015-11-20
 
 > A reverse engineering of a BSMT2000 DSP used on the audio circuit
 > of an old-school pinball. An overview of the electronic design of

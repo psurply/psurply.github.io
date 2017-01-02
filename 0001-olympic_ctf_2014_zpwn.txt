@@ -1,5 +1,6 @@
 Olympic-CTF 2014: zpwn (200 points)
 ===================================
+2014-02-10
 
 This challenge was based on an IBM s/390 ELF running on a remote server
 which listens on UDP port 31337.
